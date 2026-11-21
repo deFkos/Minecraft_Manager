@@ -3,7 +3,11 @@
   "private": true,
   "version": "1.0.0",
   "description": "Менеджер сервера Minecraft и автоустановщик клиента TLauncher (NeoForge 1.21.1)",
-  "author": "NeoCraft Control",
+  "author": {
+    "name": "NeoCraft Control",
+    "email": "maintainers@neocraft-control.local"
+  },
+  "homepage": "https://github.com/neocraft-control/neocraft-control",
   "type": "module",
   "main": "dist-electron/main.mjs",
   "scripts": {

@@ -43,4 +43,6 @@ linux:
         - x64
   icon: electron-resources/icon.png
   category: Utility
+  maintainer: NeoCraft Control <maintainers@neocraft-control.local>
+  vendor: NeoCraft Control
   artifactName: NeoCraft-Control-${version}.${ext}
