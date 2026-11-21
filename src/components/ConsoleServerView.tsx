@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertCircle,
   ArrowDown,
   CheckCircle2,
   Cpu,
   FolderOpen,
+  RefreshCw,
   Search,
   Send,
   Shield,
@@ -13,6 +15,7 @@ import {
   UserPlus,
 } from 'lucide-react';
 import type {
+  JavaDetectionResult,
   LogEntry,
   LogLevel,
   ServerConfig,
@@ -23,6 +26,8 @@ interface ConsoleServerViewProps {
   logs: LogEntry[];
   runtime: ServerRuntimeState;
   config: ServerConfig;
+  javaDetection: JavaDetectionResult;
+  onDetectJava: () => Promise<void>;
   onSendCommand: (command: string) => Promise<void>;
   onClearLogs: () => Promise<void>;
   onUpdateConfig: (patch: Partial<ServerConfig>) => Promise<void>;
@@ -42,6 +47,8 @@ export function ConsoleServerView({
   logs,
   runtime,
   config,
+  javaDetection,
+  onDetectJava,
   onSendCommand,
   onClearLogs,
   onUpdateConfig,
@@ -55,6 +62,7 @@ export function ConsoleServerView({
   const [logFilter, setLogFilter] = useState<'ALL' | 'WARN' | 'ERROR'>('ALL');
   const [logSearch, setLogSearch] = useState('');
   const [autoScroll, setAutoScroll] = useState(true);
+  const [detectingJava, setDetectingJava] = useState(false);
 
   // Quick player actions
   const [nickname, setNickname] = useState('');
@@ -583,19 +591,67 @@ export function ConsoleServerView({
             </div>
           </div>
 
-          {/* Java path */}
-          <div className="space-y-1.5">
-            <label htmlFor="java-path" className="block text-xs font-medium text-slate-300">
-              Путь к Java (JDK 21)
-            </label>
-            <input
-              id="java-path"
-              type="text"
-              value={javaPath}
-              onChange={(e) => setJavaPath(e.target.value)}
-              placeholder="java"
-              className="w-full px-3 py-1.5 rounded-lg bg-[#0B1120] border border-slate-800 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
-            />
+          {/* Auto-detected Java (JDK 21) */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="java-select" className="block text-xs font-medium text-slate-300">
+                Java (автопоиск)
+              </label>
+              <button
+                type="button"
+                disabled={detectingJava}
+                onClick={async () => {
+                  setDetectingJava(true);
+                  try {
+                    await onDetectJava();
+                  } finally {
+                    setDetectingJava(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-indigo-400 hover:text-indigo-300 transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${detectingJava ? 'animate-spin' : ''}`} />
+                Найти Java
+              </button>
+            </div>
+
+            {javaDetection.installations.length > 0 ? (
+              <div className="space-y-1.5">
+                <select
+                  id="java-select"
+                  value={javaPath}
+                  onChange={(e) => setJavaPath(e.target.value)}
+                  className="w-full px-3 py-1.5 rounded-lg bg-[#0B1120] border border-emerald-500/35 text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
+                >
+                  {javaDetection.installations.map((inst) => (
+                    <option key={inst.path} value={inst.path} className="bg-[#0B1120] text-slate-100">
+                      Java {inst.version} ({inst.vendor} · {inst.source})
+                    </option>
+                  ))}
+                  {!javaDetection.installations.some((i) => i.path === javaPath) && javaPath && (
+                    <option value={javaPath} className="bg-[#0B1120] text-slate-100">
+                      {javaPath}
+                    </option>
+                  )}
+                </select>
+                <p
+                  className={`text-[11px] font-mono truncate flex items-center gap-1.5 ${
+                    javaDetection.hasCompatible21 ? 'text-emerald-400' : 'text-amber-400'
+                  }`}
+                  title={javaPath}
+                >
+                  <CheckCircle2 className="w-3 h-3 shrink-0" />
+                  <span className="truncate">{javaPath}</span>
+                </p>
+              </div>
+            ) : (
+              <div className="rounded-lg bg-amber-500/[0.06] border border-amber-500/25 px-3 py-2 text-xs text-amber-200 flex items-start gap-2">
+                <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                <span>
+                  Java не найдена в системе. Установите JDK 21 (adoptium.net) и нажмите «Найти Java».
+                </span>
+              </div>
+            )}
           </div>
 
           <button

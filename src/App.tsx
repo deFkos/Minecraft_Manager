@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertCircle, RefreshCw } from 'lucide-react';
-import type { AppFullState, ServerConfig } from '../shared/types';
+import type { AppFullState, ServerConfig, WorkspaceMode } from '../shared/types';
 import { desktopApi } from './lib/desktopBridge';
 import { Sidebar, type ActiveTab } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
@@ -248,6 +248,46 @@ export default function App() {
     }
   };
 
+  const handleDetectJava = async () => {
+    try {
+      const javaDetection = await desktopApi.detectJava();
+      const refreshed = await desktopApi.getState();
+      setState({ ...refreshed, javaDetection });
+      if (javaDetection.selectedPath) {
+        const best = javaDetection.installations[0];
+        pushToast(
+          'success',
+          `Java ${best?.version || ''} найдена автоматически`,
+          javaDetection.selectedPath
+        );
+      } else {
+        pushToast(
+          'info',
+          'Java не найдена',
+          'Установите Eclipse Temurin JDK 21 (adoptium.net) и повторите поиск.'
+        );
+      }
+    } catch (err) {
+      pushToast('error', 'Ошибка поиска Java', err instanceof Error ? err.message : undefined);
+    }
+  };
+
+  const handleSwitchMode = async (mode: WorkspaceMode) => {
+    try {
+      const next = await desktopApi.setWorkspaceMode(mode);
+      setState(next);
+      pushToast(
+        'info',
+        mode === 'sandbox' ? 'Включён режим песочницы' : 'Включён режим реального ПК',
+        mode === 'sandbox'
+          ? 'Можно безопасно тестировать консоль и моды без JAR-ядра'
+          : 'Используются реальные директории вашего компьютера'
+      );
+    } catch (err) {
+      pushToast('error', 'Не удалось переключить режим', err instanceof Error ? err.message : undefined);
+    }
+  };
+
   const handleDetectTLauncher = async () => {
     try {
       const clientDetection = await desktopApi.detectTLauncher();
@@ -336,6 +376,7 @@ export default function App() {
         environment={state.environment}
         platform={state.platform}
         mode={state.config.mode}
+        onSwitchMode={(mode) => void handleSwitchMode(mode)}
         modsCount={state.mods.serverMods.length}
         unsyncedModsCount={unsyncedModsCount}
       />
@@ -357,6 +398,8 @@ export default function App() {
                 logs={state.logs}
                 runtime={state.runtime}
                 config={state.config}
+                javaDetection={state.javaDetection}
+                onDetectJava={handleDetectJava}
                 onSendCommand={handleSendCommand}
                 onClearLogs={handleClearLogs}
                 onUpdateConfig={handleUpdateConfig}

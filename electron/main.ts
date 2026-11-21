@@ -106,6 +106,8 @@ function registerIpcHandlers(service: CoreBackendService): void {
     service.deleteServerMod(String(fileName ?? ''))
   );
 
+  ipcMain.handle(IPC_CHANNELS.JAVA_DETECT, () => service.detectJavaInstallations(true));
+
   ipcMain.handle(IPC_CHANNELS.CLIENT_DETECT_TLAUNCHER, () => service.detectTLauncher());
   ipcMain.handle(IPC_CHANNELS.CLIENT_SETUP_NEOFORGE, (_e, options: unknown) =>
     service.setupNeoForgeClient(
@@ -155,17 +157,30 @@ function registerIpcHandlers(service: CoreBackendService): void {
   ipcMain.on(IPC_CHANNELS.WINDOW_CLOSE, () => mainWindow?.close());
 }
 
-void app.whenReady().then(() => {
-  coreService = new CoreBackendService('electron', app.getAppPath());
-  registerIpcHandlers(coreService);
-  createWindow();
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
     }
   });
-});
+
+  void app.whenReady().then(() => {
+    coreService = new CoreBackendService('electron', app.getAppPath());
+    registerIpcHandlers(coreService);
+    createWindow();
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
+  });
+}
 
 app.on('window-all-closed', () => {
   if (coreService) {

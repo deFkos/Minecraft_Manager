@@ -6,6 +6,7 @@ import type {
   CopyModsResult,
   DesktopAPI,
   FsBrowseResult,
+  JavaDetectionResult,
   LogEntry,
   ModsState,
   NetworkSettings,
@@ -135,6 +136,7 @@ const webPreviewApi: DesktopAPI = {
     apiJson<ModsState>(`/api/mods/server/${encodeURIComponent(fileName)}`, {
       method: 'DELETE',
     }),
+  detectJava: () => apiJson<JavaDetectionResult>('/api/java/detect'),
   detectTLauncher: () => apiJson<ClientDetectionResult>('/api/client/detect'),
   setupNeoForgeClient: (options) =>
     apiJson<ClientSetupResult>('/api/client/setup', {

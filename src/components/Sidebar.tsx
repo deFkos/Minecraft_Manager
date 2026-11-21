@@ -9,6 +9,7 @@ interface SidebarProps {
   environment: RuntimeEnvironment;
   platform: string;
   mode: WorkspaceMode;
+  onSwitchMode: (mode: WorkspaceMode) => void;
   modsCount: number;
   unsyncedModsCount: number;
 }
@@ -51,6 +52,7 @@ export function Sidebar({
   environment,
   platform,
   mode,
+  onSwitchMode,
   modsCount,
   unsyncedModsCount,
 }: SidebarProps) {
@@ -109,22 +111,50 @@ export function Sidebar({
       </nav>
 
       {/* Compact environment metadata footer */}
-      <div className="px-4 py-3.5 border-t border-slate-800/90 text-xs text-slate-400 space-y-1">
-        <div className="flex items-center justify-between">
-          <span className="text-slate-500">Среда</span>
-          <span className="font-mono text-slate-300">
-            {environment === 'electron' ? 'Electron IPC' : 'Web Песочница'}
-          </span>
-        </div>
-        <div className="flex items-center justify-between">
-          <span className="text-slate-500">Платформа</span>
-          <span className="font-mono text-slate-300">
-            {osLabel} · {mode === 'sandbox' ? 'Sandbox' : 'Native'}
-          </span>
-        </div>
-        <div className="flex items-center justify-between">
-          <span className="text-slate-500">Модов на сервере</span>
-          <span className="font-mono tabular-nums text-slate-300">{modsCount} .jar</span>
+      <div className="px-4 py-3.5 border-t border-slate-800/90 text-xs text-slate-400 space-y-2">
+        {environment === 'electron' && (
+          <div className="flex items-center gap-1 p-0.5 rounded-lg bg-[#0B1120] border border-slate-800">
+            <button
+              type="button"
+              onClick={() => onSwitchMode('native')}
+              className={`flex-1 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                mode === 'native'
+                  ? 'bg-slate-800 text-slate-100'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Реальный ПК
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchMode('sandbox')}
+              className={`flex-1 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                mode === 'sandbox'
+                  ? 'bg-slate-800 text-slate-100'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Песочница
+            </button>
+          </div>
+        )}
+        <div className="space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Среда</span>
+            <span className="font-mono text-slate-300">
+              {environment === 'electron' ? 'Electron IPC' : 'Web Песочница'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Платформа</span>
+            <span className="font-mono text-slate-300">
+              {osLabel} · {mode === 'sandbox' ? 'Sandbox' : 'Native'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Модов на сервере</span>
+            <span className="font-mono tabular-nums text-slate-300">{modsCount} .jar</span>
+          </div>
         </div>
       </div>
     </aside>

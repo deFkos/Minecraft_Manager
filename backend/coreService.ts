@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,6 +12,8 @@ import type {
   CopyModsResult,
   FsBrowseEntry,
   FsBrowseResult,
+  JavaDetectionResult,
+  JavaInstallation,
   LogEntry,
   LogLevel,
   ModFileInfo,
@@ -118,6 +120,7 @@ export class CoreBackendService extends EventEmitter {
   private clientSteps: ClientSetupStep[] = createInitialSteps();
   private lastClientSetup: ClientSetupResult | null = null;
   private isClientSetupRunning = false;
+  private javaDetection: JavaDetectionResult;
 
   constructor(environment: RuntimeEnvironment, projectRoot = process.cwd()) {
     super();
@@ -137,6 +140,8 @@ export class CoreBackendService extends EventEmitter {
     const defaultMode: WorkspaceMode = environment === 'electron' ? 'native' : 'sandbox';
     this.config = this.buildDefaultConfig(defaultMode);
 
+    this.javaDetection = this.detectJavaInstallations(true);
+
     this.runtime = {
       status: 'offline',
       pid: null,
@@ -146,6 +151,197 @@ export class CoreBackendService extends EventEmitter {
       lastError: null,
       players: this.readPlayersFromDisk(this.config.serverDir),
     };
+  }
+
+  private probeJavaBinary(javaBin: string, source: string): JavaInstallation | null {
+    try {
+      const result = spawnSync(javaBin, ['-version'], {
+        shell: false,
+        timeout: 3000,
+        encoding: 'utf8',
+      });
+      if (result.error) return null;
+      const output = `${result.stderr || ''}\n${result.stdout || ''}`.trim();
+      if (!output) return null;
+
+      const verMatch = output.match(/version\s+"([^"]+)"/i);
+      const rawVersion = verMatch ? verMatch[1] : 'unknown';
+      let majorVersion = 0;
+      if (rawVersion.startsWith('1.')) {
+        majorVersion = Number.parseInt(rawVersion.split('.')[1] || '0', 10) || 0;
+      } else {
+        majorVersion = Number.parseInt(rawVersion.split('.')[0] || '0', 10) || 0;
+      }
+
+      const vendorLine =
+        output
+          .split(/\r?\n/)
+          .find((l) => /Temurin|OpenJDK|Java\(TM\)|Zulu|Corretto|Microsoft|Liberica|GraalVM/i.test(l)) ||
+        'OpenJDK';
+      const vendor = /Temurin/i.test(vendorLine)
+        ? 'Eclipse Temurin'
+        : /Microsoft/i.test(vendorLine)
+          ? 'Microsoft OpenJDK'
+          : /Zulu/i.test(vendorLine)
+            ? 'Azul Zulu'
+            : /Corretto/i.test(vendorLine)
+              ? 'Amazon Corretto'
+              : /Liberica/i.test(vendorLine)
+                ? 'BellSoft Liberica'
+                : /Java\(TM\)/i.test(vendorLine)
+                  ? 'Oracle Java'
+                  : 'OpenJDK';
+
+      return {
+        path: javaBin,
+        version: rawVersion,
+        majorVersion,
+        vendor,
+        source,
+        isRecommended: majorVersion >= 21,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  public detectJavaInstallations(autoSelectBest = true): JavaDetectionResult {
+    const isWin = process.platform === 'win32';
+    const exeName = isWin ? 'java.exe' : 'java';
+    const candidates: Array<{ bin: string; source: string }> = [];
+    const seen = new Set<string>();
+
+    const addCandidate = (bin: string, source: string) => {
+      if (!bin) return;
+      const normalized = bin === exeName || bin === 'java' ? bin : path.resolve(bin);
+      const key = isWin ? normalized.toLowerCase() : normalized;
+      if (seen.has(key)) return;
+      if (normalized !== exeName && normalized !== 'java' && !fs.existsSync(normalized)) return;
+      seen.add(key);
+      candidates.push({ bin: normalized, source });
+    };
+
+    const scanChildrenForJava = (baseDir: string, source: string, depth = 1) => {
+      try {
+        if (!baseDir || !fs.existsSync(baseDir)) return;
+        const directBin = path.join(baseDir, 'bin', exeName);
+        if (fs.existsSync(directBin)) {
+          addCandidate(directBin, source);
+        }
+        if (depth <= 0) return;
+        for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          scanChildrenForJava(path.join(baseDir, entry.name), source, depth - 1);
+        }
+      } catch {
+        // Ignore unreadable system folders
+      }
+    };
+
+    // 1. JAVA_HOME
+    if (process.env.JAVA_HOME) {
+      addCandidate(path.join(process.env.JAVA_HOME, 'bin', exeName), 'JAVA_HOME');
+    }
+
+    // 2. System PATH resolution (where / which)
+    try {
+      const locator = spawnSync(isWin ? 'where' : 'which', [isWin ? 'java.exe' : 'java'], {
+        shell: false,
+        timeout: 2500,
+        encoding: 'utf8',
+      });
+      if (locator.status === 0 && locator.stdout) {
+        for (const line of locator.stdout.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (trimmed) addCandidate(trimmed, 'PATH');
+        }
+      }
+    } catch {
+      // Ignore if where/which fails
+    }
+
+    // 3. OS-specific standard JDK/JRE & TLauncher JVM folders
+    if (isWin) {
+      const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+      const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+      const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+      const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+
+      const winRoots: Array<{ dir: string; source: string; depth: number }> = [
+        { dir: path.join(programFiles, 'Eclipse Adoptium'), source: 'Eclipse Adoptium', depth: 2 },
+        { dir: path.join(programFiles, 'Java'), source: 'Program Files\\Java', depth: 2 },
+        { dir: path.join(programFiles, 'Microsoft'), source: 'Microsoft JDK', depth: 2 },
+        { dir: path.join(programFiles, 'Zulu'), source: 'Azul Zulu', depth: 2 },
+        { dir: path.join(programFiles, 'BellSoft'), source: 'BellSoft Liberica', depth: 2 },
+        { dir: path.join(programFiles, 'Amazon Corretto'), source: 'Amazon Corretto', depth: 2 },
+        { dir: path.join(programFiles, 'AdoptOpenJDK'), source: 'AdoptOpenJDK', depth: 2 },
+        { dir: path.join(localAppData, 'Programs', 'Eclipse Adoptium'), source: 'Eclipse Adoptium', depth: 2 },
+        { dir: path.join(programFilesX86, 'Java'), source: 'Program Files (x86)\\Java', depth: 2 },
+        { dir: path.join(appData, '.tlauncher', 'jvms'), source: 'TLauncher JVM', depth: 2 },
+        { dir: path.join(appData, '.minecraft', 'runtime'), source: 'Minecraft Runtime', depth: 3 },
+      ];
+      for (const root of winRoots) {
+        scanChildrenForJava(root.dir, root.source, root.depth);
+      }
+    } else {
+      const linuxRoots: Array<{ dir: string; source: string; depth: number }> = [
+        { dir: '/usr/lib/jvm', source: '/usr/lib/jvm', depth: 2 },
+        { dir: '/usr/java', source: '/usr/java', depth: 2 },
+        { dir: '/opt/java', source: '/opt/java', depth: 2 },
+        { dir: path.join(os.homedir(), '.sdkman', 'candidates', 'java'), source: 'SDKMAN', depth: 2 },
+        { dir: path.join(os.homedir(), '.tlauncher', 'jvms'), source: 'TLauncher JVM', depth: 2 },
+      ];
+      for (const root of linuxRoots) {
+        scanChildrenForJava(root.dir, root.source, root.depth);
+      }
+    }
+
+    // 4. Fallback to bare java command in PATH
+    addCandidate(exeName, 'PATH');
+
+    const installations: JavaInstallation[] = [];
+    const seenRealPaths = new Set<string>();
+
+    for (const candidate of candidates) {
+      const probed = this.probeJavaBinary(candidate.bin, candidate.source);
+      if (!probed) continue;
+      let realKey = isWin ? probed.path.toLowerCase() : probed.path;
+      try {
+        if (fs.existsSync(probed.path)) {
+          const rp = fs.realpathSync(probed.path);
+          realKey = isWin ? rp.toLowerCase() : rp;
+        }
+      } catch {
+        // ignore realpath errors
+      }
+      if (seenRealPaths.has(realKey)) continue;
+      seenRealPaths.add(realKey);
+      installations.push(probed);
+    }
+
+    // Sort: Java 21 exact first, then >= 21 descending, then highest majorVersion
+    installations.sort((a, b) => {
+      const score = (j: JavaInstallation) => {
+        if (j.majorVersion === 21) return 1000;
+        if (j.majorVersion > 21) return 900 - (j.majorVersion - 21);
+        return j.majorVersion;
+      };
+      return score(b) - score(a);
+    });
+
+    const best = installations[0] ?? null;
+    if (autoSelectBest && best) {
+      this.config.javaPath = best.path;
+    }
+
+    this.javaDetection = {
+      installations,
+      selectedPath: best ? best.path : null,
+      hasCompatible21: installations.some((j) => j.majorVersion >= 21),
+      detectedAt: new Date().toISOString(),
+    };
+
+    return this.javaDetection;
   }
 
   private getNativeMinecraftPath(): string {
@@ -316,6 +512,7 @@ export class CoreBackendService extends EventEmitter {
       },
       logs: [...this.logs],
       mods: this.scanMods(this.config.modsSourceDir),
+      javaDetection: { ...this.javaDetection },
       clientDetection: this.detectTLauncher(),
       clientSteps: this.clientSteps.map((s) => ({ ...s })),
       lastClientSetup: this.lastClientSetup ? { ...this.lastClientSetup } : null,
@@ -336,6 +533,9 @@ export class CoreBackendService extends EventEmitter {
       await this.stopServer();
     }
     this.config = this.buildDefaultConfig(mode);
+    if (this.javaDetection.selectedPath) {
+      this.config.javaPath = this.javaDetection.selectedPath;
+    }
     this.runtime.eulaAccepted = this.checkEulaAccepted(this.config.serverDir);
     this.runtime.players = this.readPlayersFromDisk(this.config.serverDir);
     return this.getFullState();
@@ -583,14 +783,54 @@ export class CoreBackendService extends EventEmitter {
 
   private isSandboxStubJar(jarPath: string): boolean {
     try {
-      if (!fs.existsSync(jarPath)) return true;
+      if (!fs.existsSync(jarPath)) return false;
       const fd = fs.openSync(jarPath, 'r');
       const buf = Buffer.alloc(24);
       fs.readSync(fd, buf, 0, 24, 0);
       fs.closeSync(fd);
       return buf.toString('utf8').startsWith('NEOCRAFT-SANDBOX-JAR');
     } catch {
-      return true;
+      return false;
+    }
+  }
+
+  private findNeoForgeArgsFile(serverDir: string): string | null {
+    const argsFileName = process.platform === 'win32' ? 'win_args.txt' : 'unix_args.txt';
+    const nfBase = path.join(serverDir, 'libraries', 'net', 'neoforged', 'neoforge');
+    try {
+      if (!fs.existsSync(nfBase)) return null;
+      const versions = fs
+        .readdirSync(nfBase, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
+        .sort()
+        .reverse();
+      for (const ver of versions) {
+        const candidate = path.join(nfBase, ver, argsFileName);
+        if (fs.existsSync(candidate)) {
+          return path.relative(serverDir, candidate);
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  private autoFindServerJar(serverDir: string): string | null {
+    try {
+      if (!fs.existsSync(serverDir)) return null;
+      const jars = fs
+        .readdirSync(serverDir, { withFileTypes: true })
+        .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.jar'))
+        .map((e) => e.name)
+        .filter((name) => !/installer/i.test(name));
+      if (jars.length === 0) return null;
+      const preferred =
+        jars.find((n) => /neoforge|server|forge|paper|purpur|fabric/i.test(n)) || jars[0];
+      return path.join(serverDir, preferred);
+    } catch {
+      return null;
     }
   }
 
@@ -601,7 +841,7 @@ export class CoreBackendService extends EventEmitter {
 
     try {
       const safeServerDir = this.resolveSafePath(this.config.serverDir);
-      const safeJarPath = this.resolveSafePath(this.config.jarFile);
+      let safeJarPath = this.resolveSafePath(this.config.jarFile);
       fs.mkdirSync(safeServerDir, { recursive: true });
 
       const createdEula = this.ensureEulaAccepted(safeServerDir);
@@ -628,6 +868,8 @@ export class CoreBackendService extends EventEmitter {
           'system',
           `Запуск процесса NeoForge 1.21.1 (режим песочницы): -Xms${this.config.xmsMb}M -Xmx${this.config.xmxMb}M -jar ${path.basename(safeJarPath)}`
         );
+        // CRITICAL: ELECTRON_RUN_AS_NODE=1 ensures packaged Electron spawns pure Node.js
+        // instead of launching a duplicate Chromium Electron instance (which locks GPU/disk cache).
         child = spawn(
           process.execPath,
           [
@@ -641,24 +883,66 @@ export class CoreBackendService extends EventEmitter {
             cwd: safeServerDir,
             shell: false,
             stdio: ['pipe', 'pipe', 'pipe'],
+            env: {
+              ...process.env,
+              ELECTRON_RUN_AS_NODE: '1',
+            },
           }
         );
       } else {
-        if (!fs.existsSync(safeJarPath)) {
-          const errMsg = `JAR-файл сервера не найден: ${safeJarPath}`;
+        // Re-detect Java automatically if current path isn't found
+        if (!this.javaDetection.installations.length || this.config.javaPath === 'java.exe' || this.config.javaPath === 'java') {
+          this.detectJavaInstallations(true);
+        }
+
+        if (!this.javaDetection.selectedPath && !fs.existsSync(this.config.javaPath)) {
+          const errMsg =
+            'Java 21 не найдена в системе. Установите Eclipse Temurin JDK 21 (adoptium.net) и нажмите «Найти Java».';
           this.appendLog('ERROR', 'system', errMsg);
           this.updateRuntimeStatus('error', errMsg);
           return { ok: false, error: errMsg };
         }
 
-        const jvmArgs = [
-          `-Xms${this.config.xmsMb}M`,
-          `-Xmx${this.config.xmxMb}M`,
-          '-jar',
-          safeJarPath,
-          'nogui',
-        ];
-        this.appendLog('SYSTEM', 'system', `Выполнение: ${this.config.javaPath} ${jvmArgs.join(' ')}`);
+        const neoForgeArgsRel = this.findNeoForgeArgsFile(safeServerDir);
+        let jvmArgs: string[];
+
+        if (neoForgeArgsRel) {
+          this.appendLog(
+            'SYSTEM',
+            'system',
+            `Обнаружено серверное ядро NeoForge (${neoForgeArgsRel}). Используется Java: ${this.config.javaPath}`
+          );
+          jvmArgs = [
+            `-Xms${this.config.xmsMb}M`,
+            `-Xmx${this.config.xmxMb}M`,
+            `@${neoForgeArgsRel}`,
+            'nogui',
+          ];
+        } else {
+          if (!fs.existsSync(safeJarPath)) {
+            const discoveredJar = this.autoFindServerJar(safeServerDir);
+            if (discoveredJar) {
+              safeJarPath = discoveredJar;
+              this.config.jarFile = discoveredJar;
+              this.appendLog('SYSTEM', 'system', `Автоматически найдено ядро сервера: ${discoveredJar}`);
+            } else {
+              const errMsg = `Ядро сервера не найдено в ${safeServerDir}. Поместите туда JAR-файл сервера (или установите NeoForge Server) либо переключите режим на «Sandbox» в сайдбаре для теста.`;
+              this.appendLog('ERROR', 'system', errMsg);
+              this.updateRuntimeStatus('error', errMsg);
+              return { ok: false, error: errMsg };
+            }
+          }
+
+          jvmArgs = [
+            `-Xms${this.config.xmsMb}M`,
+            `-Xmx${this.config.xmxMb}M`,
+            '-jar',
+            safeJarPath,
+            'nogui',
+          ];
+        }
+
+        this.appendLog('SYSTEM', 'system', `Выполнение: "${this.config.javaPath}" ${jvmArgs.join(' ')}`);
         child = spawn(this.config.javaPath, jvmArgs, {
           cwd: safeServerDir,
           shell: false,

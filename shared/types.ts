@@ -113,6 +113,22 @@ export interface ServerRuntimeState {
   players: PlayerLists;
 }
 
+export interface JavaInstallation {
+  path: string;
+  version: string;
+  majorVersion: number;
+  vendor: string;
+  source: string;
+  isRecommended: boolean;
+}
+
+export interface JavaDetectionResult {
+  installations: JavaInstallation[];
+  selectedPath: string | null;
+  hasCompatible21: boolean;
+  detectedAt: string;
+}
+
 export interface AppFullState {
   environment: RuntimeEnvironment;
   platform: string;
@@ -122,6 +138,7 @@ export interface AppFullState {
   runtime: ServerRuntimeState;
   logs: LogEntry[];
   mods: ModsState;
+  javaDetection: JavaDetectionResult;
   clientDetection: ClientDetectionResult;
   clientSteps: ClientSetupStep[];
   lastClientSetup: ClientSetupResult | null;
@@ -156,6 +173,7 @@ export const IPC_CHANNELS = {
   MODS_SCAN: 'mods:scan-folder',
   MODS_COPY_TO_SERVER: 'mods:copy-to-server',
   MODS_DELETE_SERVER_MOD: 'mods:delete-server-mod',
+  JAVA_DETECT: 'java:detect',
   CLIENT_DETECT_TLAUNCHER: 'client:detect-tlauncher',
   CLIENT_SETUP_NEOFORGE: 'client:setup-neoforge',
   DIALOG_SELECT_DIRECTORY: 'dialog:select-directory',
@@ -187,6 +205,7 @@ export interface DesktopAPI {
   scanMods(sourceDir?: string): Promise<ModsState>;
   copyModsToServer(sourceDir?: string): Promise<{ result: CopyModsResult; mods: ModsState }>;
   deleteServerMod(fileName: string): Promise<ModsState>;
+  detectJava(): Promise<JavaDetectionResult>;
   detectTLauncher(): Promise<ClientDetectionResult>;
   setupNeoForgeClient(options: {
     minecraftDir: string;

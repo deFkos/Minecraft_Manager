@@ -23,6 +23,9 @@ declare module 'electron' {
     minimize(): void;
     maximize(): void;
     unmaximize(): void;
+    restore(): void;
+    focus(): void;
+    isMinimized(): boolean;
     isMaximized(): boolean;
     close(): void;
     isDestroyed(): boolean;
@@ -35,6 +38,7 @@ declare module 'electron' {
     on(event: string, listener: (...args: unknown[]) => void): void;
     quit(): void;
     getAppPath(): string;
+    requestSingleInstanceLock(): boolean;
     isPackaged: boolean;
   };
 

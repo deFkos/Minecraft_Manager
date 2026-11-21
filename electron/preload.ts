@@ -8,6 +8,7 @@ import {
   type CopyModsResult,
   type DesktopAPI,
   type FsBrowseResult,
+  type JavaDetectionResult,
   type LogEntry,
   type ModsState,
   type NetworkSettings,
@@ -58,6 +59,8 @@ const electronAPI: DesktopAPI = {
     }>,
   deleteServerMod: (fileName: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.MODS_DELETE_SERVER_MOD, fileName) as Promise<ModsState>,
+  detectJava: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.JAVA_DETECT) as Promise<JavaDetectionResult>,
   detectTLauncher: () =>
     ipcRenderer.invoke(IPC_CHANNELS.CLIENT_DETECT_TLAUNCHER) as Promise<ClientDetectionResult>,
   setupNeoForgeClient: (options) =>

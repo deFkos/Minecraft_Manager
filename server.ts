@@ -154,6 +154,11 @@ async function bootstrap(): Promise<void> {
   );
 
   app.get(
+    '/api/java/detect',
+    handleRoute(() => coreService.detectJavaInstallations(true))
+  );
+
+  app.get(
     '/api/client/detect',
     handleRoute(() => coreService.detectTLauncher())
   );
