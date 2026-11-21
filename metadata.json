@@ -1,0 +1,8 @@
+{
+  "name": "NeoCraft Control",
+  "description": "Кроссплатформенный менеджер сервера Minecraft и автоустановщик клиента TLauncher с NeoForge 1.21.1 (21.1.267).",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
