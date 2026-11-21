@@ -129,6 +129,20 @@ export interface JavaDetectionResult {
   detectedAt: string;
 }
 
+export interface ServerCoreStatus {
+  initialized: boolean;
+  needsInitialSetup: boolean;
+  coreDetected: boolean;
+  coreType: 'neoforge-args' | 'jar' | 'sandbox' | 'missing';
+  coreLabel: string;
+  corePath: string | null;
+  cachedInstallerPath: string | null;
+  installing: boolean;
+  installStage: string | null;
+  installPercent: number;
+  installError: string | null;
+}
+
 export interface AppFullState {
   environment: RuntimeEnvironment;
   platform: string;
@@ -139,6 +153,7 @@ export interface AppFullState {
   logs: LogEntry[];
   mods: ModsState;
   javaDetection: JavaDetectionResult;
+  serverCore: ServerCoreStatus;
   clientDetection: ClientDetectionResult;
   clientSteps: ClientSetupStep[];
   lastClientSetup: ClientSetupResult | null;
@@ -163,6 +178,8 @@ export const IPC_CHANNELS = {
   APP_GET_STATE: 'app:get-state',
   APP_SET_MODE: 'app:set-mode',
   SERVER_UPDATE_CONFIG: 'server:update-config',
+  SERVER_INITIALIZE: 'server:initialize',
+  SERVER_DISMISS_SETUP: 'server:dismiss-setup',
   SERVER_START: 'server:start',
   SERVER_STOP: 'server:stop',
   SERVER_RESTART: 'server:restart',
@@ -188,6 +205,7 @@ export const IPC_CHANNELS = {
   EVENT_SERVER_LOG: 'event:server-log',
   EVENT_PLAYERS_UPDATE: 'event:players-update',
   EVENT_CLIENT_SETUP_PROGRESS: 'event:client-setup-progress',
+  EVENT_SERVER_INSTALL_PROGRESS: 'event:server-install-progress',
 } as const;
 
 export interface DesktopAPI {
@@ -195,6 +213,8 @@ export interface DesktopAPI {
   getState(): Promise<AppFullState>;
   setWorkspaceMode(mode: WorkspaceMode): Promise<AppFullState>;
   updateServerConfig(patch: Partial<ServerConfig>): Promise<AppFullState>;
+  initializeServer(serverDir?: string): Promise<{ ok: boolean; state?: AppFullState; error?: string }>;
+  dismissInitialSetup(): Promise<{ ok: boolean }>;
   startServer(): Promise<{ ok: boolean; error?: string }>;
   stopServer(): Promise<{ ok: boolean; error?: string }>;
   restartServer(): Promise<{ ok: boolean; error?: string }>;
@@ -221,4 +241,5 @@ export interface DesktopAPI {
   onServerLog(cb: (entry: LogEntry) => void): () => void;
   onPlayersUpdate(cb: (players: PlayerLists) => void): () => void;
   onClientSetupProgress(cb: (steps: ClientSetupStep[]) => void): () => void;
+  onServerInstallProgress(cb: (status: ServerCoreStatus) => void): () => void;
 }

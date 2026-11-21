@@ -1,18 +1,36 @@
-name: Build Desktop Installers (Setup.exe & AppImage)
+name: Build Windows Installer (Setup.exe) & Release
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Опубликовать GitHub Release после сборки'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Тег релиза (например, v1.0.1 — используется если включена публикация)'
+        type: string
+        default: 'v1.0.0'
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-installers-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-windows:
-    name: Windows Installer (Setup.exe)
+    name: Build Windows Setup.exe
     runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,19 +41,35 @@ jobs:
           node-version: 22
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-audit --no-fund
 
-      - name: Build NeoCraft-Control-Setup.exe
+      - name: TypeScript type check
+        run: npm run lint
+
+      - name: Build Windows Installer (NeoCraft-Control-Setup.exe)
         run: npm run electron:build:win
 
-      - name: Upload Setup.exe artifact
+      - name: Verify built Setup.exe
+        shell: pwsh
+        run: |
+          $exeFiles = Get-ChildItem -Path release -Filter "*.exe" -ErrorAction SilentlyContinue
+          if (-not $exeFiles -or $exeFiles.Count -eq 0) {
+            Write-Error "Setup.exe was not generated in release/"
+            exit 1
+          }
+          $exeFiles | Format-Table Name, Length
+
+      - name: Upload Windows Setup.exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: NeoCraft-Control-Windows-Setup
           path: release/*.exe
+          if-no-files-found: error
+          retention-days: 30
 
   build-linux:
-    name: Linux Installers (AppImage & deb)
+    name: Build Linux Installers (AppImage & deb)
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -47,7 +81,7 @@ jobs:
           node-version: 22
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-audit --no-fund
 
       - name: Build AppImage & deb
         run: npm run electron:build:linux
@@ -59,21 +93,26 @@ jobs:
           path: |
             release/*.AppImage
             release/*.deb
+          if-no-files-found: error
+          retention-days: 30
 
-  release:
+  publish-release:
     name: Publish GitHub Release
     needs: [build-windows, build-linux]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download Windows & Linux artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release with Setup.exe
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+          name: NeoCraft Control ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+          generate_release_notes: true
           files: |
             artifacts/NeoCraft-Control-Windows-Setup/*.exe
             artifacts/NeoCraft-Control-Linux/*.AppImage

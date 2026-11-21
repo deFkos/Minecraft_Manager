@@ -14,6 +14,7 @@ import {
   type NetworkSettings,
   type PlayerLists,
   type ServerConfig,
+  type ServerCoreStatus,
   type ServerRuntimeState,
   type WorkspaceMode,
 } from '../shared/types.ts';
@@ -31,6 +32,14 @@ const electronAPI: DesktopAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.APP_SET_MODE, mode) as Promise<AppFullState>,
   updateServerConfig: (patch: Partial<ServerConfig>) =>
     ipcRenderer.invoke(IPC_CHANNELS.SERVER_UPDATE_CONFIG, patch) as Promise<AppFullState>,
+  initializeServer: (serverDir?: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SERVER_INITIALIZE, serverDir) as Promise<{
+      ok: boolean;
+      state?: AppFullState;
+      error?: string;
+    }>,
+  dismissInitialSetup: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.SERVER_DISMISS_SETUP) as Promise<{ ok: boolean }>,
   startServer: () =>
     ipcRenderer.invoke(IPC_CHANNELS.SERVER_START) as Promise<{ ok: boolean; error?: string }>,
   stopServer: () =>
@@ -89,6 +98,8 @@ const electronAPI: DesktopAPI = {
   onPlayersUpdate: (cb) => subscribe<PlayerLists>(IPC_CHANNELS.EVENT_PLAYERS_UPDATE, cb),
   onClientSetupProgress: (cb) =>
     subscribe<ClientSetupStep[]>(IPC_CHANNELS.EVENT_CLIENT_SETUP_PROGRESS, cb),
+  onServerInstallProgress: (cb) =>
+    subscribe<ServerCoreStatus>(IPC_CHANNELS.EVENT_SERVER_INSTALL_PROGRESS, cb),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

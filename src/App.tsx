@@ -9,6 +9,7 @@ import { NetworkView } from './components/NetworkView';
 import { ModsView } from './components/ModsView';
 import { TLauncherClientView } from './components/TLauncherClientView';
 import { FileBrowserModal, type FilePickerRequest } from './components/FileBrowserModal';
+import { ServerInitModal } from './components/ServerInitModal';
 import { ToastContainer, type ToastItem } from './components/ToastContainer';
 
 export default function App() {
@@ -18,6 +19,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('console');
   const [busyAction, setBusyAction] = useState<'start' | 'stop' | 'restart' | null>(null);
   const [pickerRequest, setPickerRequest] = useState<FilePickerRequest | null>(null);
+  const [showInitModal, setShowInitModal] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   const pushToast = useCallback(
@@ -41,6 +43,9 @@ export default function App() {
     try {
       const fullState = await desktopApi.getState();
       setState(fullState);
+      if (fullState.serverCore.needsInitialSetup) {
+        setShowInitModal(true);
+      }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Не удалось подключиться к бэкенду.');
     } finally {
@@ -76,11 +81,16 @@ export default function App() {
       setState((prev) => (prev ? { ...prev, clientSteps: steps } : prev));
     });
 
+    const unsubServerInstall = desktopApi.onServerInstallProgress((serverCore) => {
+      setState((prev) => (prev ? { ...prev, serverCore } : prev));
+    });
+
     return () => {
       unsubStatus();
       unsubLog();
       unsubPlayers();
       unsubSteps();
+      unsubServerInstall();
     };
   }, [loadInitialState]);
 
@@ -194,6 +204,45 @@ export default function App() {
     } catch (err) {
       pushToast('error', 'Ошибка сохранения настроек', err instanceof Error ? err.message : undefined);
       throw err;
+    }
+  };
+
+  const handleInitializeServer = async (targetDir?: string) => {
+    try {
+      const res = await desktopApi.initializeServer(targetDir);
+      if (res.ok && res.state) {
+        setState(res.state);
+        setShowInitModal(false);
+        pushToast(
+          'success',
+          'Сервер NeoForge 1.21.1 инициализирован',
+          `Директория: ${res.state.config.serverDir}`
+        );
+      } else {
+        const refreshed = await desktopApi.getState();
+        setState(refreshed);
+        pushToast('error', 'Ошибка инициализации сервера', res.error);
+      }
+    } catch (err) {
+      pushToast(
+        'error',
+        'Ошибка инициализации сервера',
+        err instanceof Error ? err.message : undefined
+      );
+    }
+  };
+
+  const handleDismissInitialSetup = async () => {
+    setShowInitModal(false);
+    try {
+      await desktopApi.dismissInitialSetup();
+      setState((prev) =>
+        prev
+          ? { ...prev, serverCore: { ...prev.serverCore, needsInitialSetup: false } }
+          : prev
+      );
+    } catch {
+      // non-fatal
     }
   };
 
@@ -399,7 +448,10 @@ export default function App() {
                 runtime={state.runtime}
                 config={state.config}
                 javaDetection={state.javaDetection}
+                serverCore={state.serverCore}
                 onDetectJava={handleDetectJava}
+                onInitializeServer={handleInitializeServer}
+                onOpenInitWizard={() => setShowInitModal(true)}
                 onSendCommand={handleSendCommand}
                 onClearLogs={handleClearLogs}
                 onUpdateConfig={handleUpdateConfig}
@@ -464,6 +516,18 @@ export default function App() {
         </main>
       </div>
 
+      <ServerInitModal
+        open={showInitModal}
+        config={state.config}
+        javaDetection={state.javaDetection}
+        serverCore={state.serverCore}
+        onPickDirectory={(title, initialPath, onSelect) =>
+          void openDirectoryPicker(title, initialPath, onSelect)
+        }
+        onDetectJava={handleDetectJava}
+        onInitialize={(targetDir) => handleInitializeServer(targetDir)}
+        onClose={() => void handleDismissInitialSetup()}
+      />
       <FileBrowserModal request={pickerRequest} onClose={() => setPickerRequest(null)} />
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>

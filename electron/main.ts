@@ -8,6 +8,7 @@ import {
   type LogEntry,
   type PlayerLists,
   type ServerConfig,
+  type ServerCoreStatus,
   type ServerRuntimeState,
   type WorkspaceMode,
 } from '../shared/types.ts';
@@ -67,6 +68,9 @@ function registerIpcHandlers(service: CoreBackendService): void {
   service.on('client-setup-progress', (steps: ClientSetupStep[]) => {
     sendToRenderer(IPC_CHANNELS.EVENT_CLIENT_SETUP_PROGRESS, steps);
   });
+  service.on('server-install-progress', (status: ServerCoreStatus) => {
+    sendToRenderer(IPC_CHANNELS.EVENT_SERVER_INSTALL_PROGRESS, status);
+  });
 
   // Request/Response IPC handlers
   ipcMain.handle(IPC_CHANNELS.APP_GET_STATE, () => service.getFullState());
@@ -76,6 +80,10 @@ function registerIpcHandlers(service: CoreBackendService): void {
   ipcMain.handle(IPC_CHANNELS.SERVER_UPDATE_CONFIG, (_e, patch: unknown) =>
     service.updateServerConfig(patch as Partial<ServerConfig>)
   );
+  ipcMain.handle(IPC_CHANNELS.SERVER_INITIALIZE, (_e, serverDir: unknown) =>
+    service.initializeServer(typeof serverDir === 'string' ? serverDir : undefined)
+  );
+  ipcMain.handle(IPC_CHANNELS.SERVER_DISMISS_SETUP, () => service.dismissInitialSetup());
   ipcMain.handle(IPC_CHANNELS.SERVER_START, () => service.startServer());
   ipcMain.handle(IPC_CHANNELS.SERVER_STOP, () => service.stopServer());
   ipcMain.handle(IPC_CHANNELS.SERVER_RESTART, () => service.restartServer());

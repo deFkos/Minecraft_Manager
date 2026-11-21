@@ -4,7 +4,9 @@ import {
   ArrowDown,
   CheckCircle2,
   Cpu,
+  Download,
   FolderOpen,
+  Loader2,
   RefreshCw,
   Search,
   Send,
@@ -13,12 +15,14 @@ import {
   Trash2,
   UserMinus,
   UserPlus,
+  Wand2,
 } from 'lucide-react';
 import type {
   JavaDetectionResult,
   LogEntry,
   LogLevel,
   ServerConfig,
+  ServerCoreStatus,
   ServerRuntimeState,
 } from '../../shared/types';
 
@@ -27,7 +31,10 @@ interface ConsoleServerViewProps {
   runtime: ServerRuntimeState;
   config: ServerConfig;
   javaDetection: JavaDetectionResult;
+  serverCore: ServerCoreStatus;
   onDetectJava: () => Promise<void>;
+  onInitializeServer: (targetDir?: string) => Promise<void>;
+  onOpenInitWizard: () => void;
   onSendCommand: (command: string) => Promise<void>;
   onClearLogs: () => Promise<void>;
   onUpdateConfig: (patch: Partial<ServerConfig>) => Promise<void>;
@@ -48,7 +55,10 @@ export function ConsoleServerView({
   runtime,
   config,
   javaDetection,
+  serverCore,
   onDetectJava,
+  onInitializeServer,
+  onOpenInitWizard,
   onSendCommand,
   onClearLogs,
   onUpdateConfig,
@@ -480,9 +490,16 @@ export function ConsoleServerView({
           <div className="flex items-center justify-between gap-2">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">Параметры запуска и JVM</h2>
-              <p className="text-xs text-slate-400 mt-0.5">RAM (Xms/Xmx), ядро JAR и путь к Java</p>
+              <p className="text-xs text-slate-400 mt-0.5">RAM (Xms/Xmx), ядро NeoForge и Java</p>
             </div>
-            <Cpu className="w-4 h-4 text-slate-500 shrink-0" />
+            <button
+              type="button"
+              onClick={onOpenInitWizard}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-medium text-slate-200 transition-colors shrink-0 whitespace-nowrap"
+            >
+              <Wand2 className="w-3 h-3 text-indigo-400" />
+              Мастер
+            </button>
           </div>
 
           {/* EULA status */}
@@ -565,30 +582,88 @@ export function ConsoleServerView({
             </div>
           </div>
 
-          {/* JAR core file */}
-          <div className="space-y-1.5">
-            <label htmlFor="jar-file" className="block text-xs font-medium text-slate-300">
-              JAR-файл ядра сервера
-            </label>
-            <div className="flex gap-1.5">
-              <input
-                id="jar-file"
-                type="text"
-                value={jarFile}
-                onChange={(e) => setJarFile(e.target.value)}
-                className="flex-1 min-w-0 px-3 py-1.5 rounded-lg bg-[#0B1120] border border-slate-800 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
-              />
-              <button
-                type="button"
-                onClick={() =>
-                  onPickFile('Выбрать JAR-файл сервера', jarFile, '.jar', (p) => setJarFile(p))
-                }
-                aria-label="Выбрать JAR-файл сервера"
-                className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-colors shrink-0"
+          {/* Server core (auto-detected & auto-downloaded) */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="jar-file" className="block text-xs font-medium text-slate-300">
+                Ядро сервера (авто)
+              </label>
+              <span
+                className={`inline-flex items-center gap-1 text-[11px] font-medium ${
+                  serverCore.installing
+                    ? 'text-indigo-400'
+                    : serverCore.coreDetected
+                      ? 'text-emerald-400'
+                      : 'text-amber-400'
+                }`}
               >
-                <FolderOpen className="w-3.5 h-3.5" />
-              </button>
+                {serverCore.installing ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Установка {serverCore.installPercent}%
+                  </>
+                ) : serverCore.coreDetected ? (
+                  <>
+                    <CheckCircle2 className="w-3 h-3" />
+                    {serverCore.coreLabel}
+                  </>
+                ) : (
+                  <>
+                    <Cpu className="w-3 h-3" />
+                    Не установлено
+                  </>
+                )}
+              </span>
             </div>
+
+            {serverCore.installing ? (
+              <div className="space-y-1.5">
+                <p className="text-[11px] text-indigo-300 truncate">
+                  {serverCore.installStage || 'Загрузка и установка NeoForge 1.21.1...'}
+                </p>
+                <div className="h-1.5 w-full rounded-full bg-[#0B1120] border border-slate-800 overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-500 transition-all duration-300"
+                    style={{ width: `${Math.max(4, Math.min(100, serverCore.installPercent))}%` }}
+                  />
+                </div>
+              </div>
+            ) : serverCore.coreDetected ? (
+              <div className="flex gap-1.5">
+                <input
+                  id="jar-file"
+                  type="text"
+                  value={jarFile}
+                  onChange={(e) => setJarFile(e.target.value)}
+                  className="flex-1 min-w-0 px-3 py-1.5 rounded-lg bg-[#0B1120] border border-emerald-500/35 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    onPickFile('Выбрать JAR-файл сервера', jarFile, '.jar', (p) => setJarFile(p))
+                  }
+                  aria-label="Выбрать JAR-файл сервера вручную"
+                  title="Выбрать другой JAR вручную"
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-colors shrink-0"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() => void onInitializeServer(serverDir)}
+                  className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/35 text-indigo-200 transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                  Скачать и установить ядро NeoForge 1.21.1
+                </button>
+                <p className="text-[11px] text-slate-500">
+                  Ядро также скачается автоматически при нажатии «Старт».
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Auto-detected Java (JDK 21) */}

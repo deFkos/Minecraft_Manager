@@ -22,6 +22,7 @@ import type {
   PlayerLists,
   RuntimeEnvironment,
   ServerConfig,
+  ServerCoreStatus,
   ServerRuntimeState,
   ServerStatus,
   SetupStepId,
@@ -32,6 +33,7 @@ const MAX_LOG_LINES = 1000;
 const NEOFORGE_MC_VERSION = '1.21.1';
 const NEOFORGE_LOADER_VERSION = '21.1.267';
 const DEFAULT_BUILD_NAME = `NeoForge-${NEOFORGE_MC_VERSION}-${NEOFORGE_LOADER_VERSION}`;
+const NEOFORGE_MAVEN_BASE = 'https://maven.neoforged.net/releases/net/neoforged/neoforge';
 
 const SAMPLE_MODS: Array<{ name: string; sizeKb: number; modId: string }> = [
   { name: 'sodium-neoforge-0.6.5+mc1.21.1.jar', sizeKb: 1184, modId: 'sodium' },
@@ -121,6 +123,15 @@ export class CoreBackendService extends EventEmitter {
   private lastClientSetup: ClientSetupResult | null = null;
   private isClientSetupRunning = false;
   private javaDetection: JavaDetectionResult;
+  private readonly appDataRoot: string;
+  private readonly configFilePath: string;
+  private readonly installerCacheDir: string;
+  private serverInitialized = false;
+  private setupPromptDismissed = false;
+  private installingCore = false;
+  private installStage: string | null = null;
+  private installPercent = 0;
+  private installError: string | null = null;
 
   constructor(environment: RuntimeEnvironment, projectRoot = process.cwd()) {
     super();
@@ -129,9 +140,16 @@ export class CoreBackendService extends EventEmitter {
     const unpackedRoot = isPackagedAsar
       ? projectRoot.replace('app.asar', 'app.asar.unpacked')
       : projectRoot;
+    this.appDataRoot =
+      environment === 'electron'
+        ? path.join(os.homedir(), '.neocraft-control')
+        : path.resolve(projectRoot, '.neocraft-sandbox', '.neocraft-meta');
+    this.configFilePath = path.join(this.appDataRoot, 'config.json');
+    this.installerCacheDir = path.join(this.appDataRoot, 'cache');
+
     this.sandboxRoot =
       environment === 'electron' && isPackagedAsar
-        ? path.join(os.homedir(), '.neocraft-control', 'sandbox')
+        ? path.join(this.appDataRoot, 'sandbox')
         : path.resolve(projectRoot, '.neocraft-sandbox');
     this.runnerScriptPath = path.resolve(unpackedRoot, 'backend', 'sandboxRunner.mjs');
 
@@ -139,8 +157,10 @@ export class CoreBackendService extends EventEmitter {
 
     const defaultMode: WorkspaceMode = environment === 'electron' ? 'native' : 'sandbox';
     this.config = this.buildDefaultConfig(defaultMode);
+    this.loadPersistedConfig();
 
     this.javaDetection = this.detectJavaInstallations(true);
+    this.syncAutoDetectedCorePath();
 
     this.runtime = {
       status: 'offline',
@@ -151,6 +171,419 @@ export class CoreBackendService extends EventEmitter {
       lastError: null,
       players: this.readPlayersFromDisk(this.config.serverDir),
     };
+  }
+
+  private loadPersistedConfig(): void {
+    try {
+      if (!fs.existsSync(this.configFilePath)) return;
+      const raw = JSON.parse(fs.readFileSync(this.configFilePath, 'utf8')) as {
+        config?: Partial<ServerConfig>;
+        serverInitialized?: boolean;
+      };
+      if (raw.config && this.environment === 'electron') {
+        if (typeof raw.config.serverDir === 'string' && raw.config.serverDir.trim()) {
+          this.config.serverDir = raw.config.serverDir.trim();
+        }
+        if (typeof raw.config.jarFile === 'string' && raw.config.jarFile.trim()) {
+          this.config.jarFile = raw.config.jarFile.trim();
+        }
+        if (typeof raw.config.modsSourceDir === 'string' && raw.config.modsSourceDir.trim()) {
+          this.config.modsSourceDir = raw.config.modsSourceDir.trim();
+        }
+        if (typeof raw.config.minecraftDir === 'string' && raw.config.minecraftDir.trim()) {
+          this.config.minecraftDir = raw.config.minecraftDir.trim();
+        }
+        if (typeof raw.config.clientBuildName === 'string' && raw.config.clientBuildName.trim()) {
+          this.config.clientBuildName = raw.config.clientBuildName.trim();
+        }
+        if (typeof raw.config.xmsMb === 'number' && Number.isInteger(raw.config.xmsMb)) {
+          this.config.xmsMb = raw.config.xmsMb;
+        }
+        if (typeof raw.config.xmxMb === 'number' && Number.isInteger(raw.config.xmxMb)) {
+          this.config.xmxMb = raw.config.xmxMb;
+        }
+      }
+      if (typeof raw.serverInitialized === 'boolean') {
+        this.serverInitialized = raw.serverInitialized;
+      }
+    } catch {
+      // ignore corrupted config file
+    }
+  }
+
+  private savePersistedConfig(): void {
+    try {
+      fs.mkdirSync(this.appDataRoot, { recursive: true });
+      fs.writeFileSync(
+        this.configFilePath,
+        JSON.stringify(
+          {
+            config: this.config,
+            serverInitialized: this.serverInitialized,
+          },
+          null,
+          2
+        ),
+        'utf8'
+      );
+    } catch {
+      // ignore persistence errors
+    }
+  }
+
+  private findCachedInstaller(): string | null {
+    const candidates = [
+      path.join(this.installerCacheDir, `neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`),
+    ];
+    try {
+      if (fs.existsSync(this.installerCacheDir)) {
+        for (const entry of fs.readdirSync(this.installerCacheDir)) {
+          if (/^neoforge-21\.1\.\d+-installer\.jar$/i.test(entry)) {
+            candidates.push(path.join(this.installerCacheDir, entry));
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+    for (const c of candidates) {
+      try {
+        if (fs.existsSync(c) && fs.statSync(c).size > 100_000) {
+          return c;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  }
+
+  private syncAutoDetectedCorePath(): void {
+    try {
+      const safeDir = this.resolveSafePath(this.config.serverDir);
+      const nfArgs = this.findNeoForgeArgsFile(safeDir);
+      if (nfArgs) {
+        this.config.jarFile = path.join(safeDir, nfArgs);
+        return;
+      }
+      if (!fs.existsSync(this.config.jarFile)) {
+        const discovered = this.autoFindServerJar(safeDir);
+        if (discovered) {
+          this.config.jarFile = discovered;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  public inspectServerCore(): ServerCoreStatus {
+    const cachedInstallerPath = this.findCachedInstaller();
+    let coreDetected = false;
+    let coreType: ServerCoreStatus['coreType'] = 'missing';
+    let coreLabel = 'Ядро не установлено (скачается автоматически)';
+    let corePath: string | null = null;
+
+    try {
+      const safeDir = this.resolveSafePath(this.config.serverDir);
+      const nfArgs = this.findNeoForgeArgsFile(safeDir);
+      if (nfArgs) {
+        coreDetected = true;
+        coreType = 'neoforge-args';
+        corePath = path.join(safeDir, nfArgs);
+        const verMatch = nfArgs.match(/neoforge[\\/]([^\\/]+)[\\/]/i);
+        coreLabel = `NeoForge ${verMatch ? verMatch[1] : NEOFORGE_LOADER_VERSION} (автовыбор)`;
+      } else if (this.config.jarFile && fs.existsSync(this.config.jarFile)) {
+        coreDetected = true;
+        const isStub = this.isSandboxStubJar(this.config.jarFile);
+        coreType = isStub ? 'sandbox' : 'jar';
+        corePath = this.config.jarFile;
+        coreLabel = isStub
+          ? `${path.basename(this.config.jarFile)} (песочница)`
+          : `${path.basename(this.config.jarFile)} (автовыбор)`;
+      } else {
+        const autoJar = this.autoFindServerJar(safeDir);
+        if (autoJar) {
+          coreDetected = true;
+          const isStub = this.isSandboxStubJar(autoJar);
+          coreType = isStub ? 'sandbox' : 'jar';
+          corePath = autoJar;
+          this.config.jarFile = autoJar;
+          coreLabel = `${path.basename(autoJar)} (найдено автоматически)`;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    const initialized = this.serverInitialized || coreDetected;
+    const needsInitialSetup =
+      !this.setupPromptDismissed &&
+      !coreDetected &&
+      this.config.mode === 'native';
+
+    return {
+      initialized,
+      needsInitialSetup,
+      coreDetected,
+      coreType,
+      coreLabel,
+      corePath,
+      cachedInstallerPath,
+      installing: this.installingCore,
+      installStage: this.installStage,
+      installPercent: this.installPercent,
+      installError: this.installError,
+    };
+  }
+
+  private emitInstallProgress(stage: string | null, percent: number, error: string | null = null): void {
+    this.installStage = stage;
+    this.installPercent = percent;
+    this.installError = error;
+    this.emit('server-install-progress', this.inspectServerCore());
+  }
+
+  public dismissInitialSetup(): { ok: boolean } {
+    this.setupPromptDismissed = true;
+    return { ok: true };
+  }
+
+  private async downloadNeoForgeInstaller(): Promise<string> {
+    const existing = this.findCachedInstaller();
+    if (existing) {
+      this.appendLog('SYSTEM', 'system', `Используется предзагруженный установщик NeoForge: ${existing}`);
+      this.emitInstallProgress('Найден предзагруженный установщик NeoForge 21.1.267', 35);
+      return existing;
+    }
+
+    fs.mkdirSync(this.installerCacheDir, { recursive: true });
+
+    const tryDownloadVersion = async (version: string): Promise<string | null> => {
+      if (!/^21\.1\.\d+$/.test(version)) return null;
+      const url = `${NEOFORGE_MAVEN_BASE}/${version}/neoforge-${version}-installer.jar`;
+      const targetPath = path.join(this.installerCacheDir, `neoforge-${version}-installer.jar`);
+      const tempPath = `${targetPath}.part`;
+
+      this.appendLog('SYSTEM', 'system', `Загрузка официального установщика NeoForge ${version} с maven.neoforged.net...`);
+      this.emitInstallProgress(`Загрузка neoforge-${version}-installer.jar...`, 12);
+
+      const response = await fetch(url, { redirect: 'follow' });
+      if (!response.ok || !response.body) {
+        return null;
+      }
+
+      const totalBytes = Number(response.headers.get('content-length') || 0);
+      const fileStream = fs.createWriteStream(tempPath);
+      const reader = response.body.getReader();
+      let received = 0;
+      let lastPct = 12;
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            fileStream.write(Buffer.from(value));
+            received += value.byteLength;
+            if (totalBytes > 0) {
+              const pct = Math.min(44, 12 + Math.round((received / totalBytes) * 32));
+              if (pct > lastPct + 2) {
+                lastPct = pct;
+                this.emitInstallProgress(
+                  `Загрузка neoforge-${version}-installer.jar (${(received / 1024 / 1024).toFixed(1)} МБ)...`,
+                  pct
+                );
+              }
+            }
+          }
+        }
+      } finally {
+        await new Promise<void>((resolve) => fileStream.end(() => resolve()));
+      }
+
+      if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 100_000) {
+        fs.renameSync(tempPath, targetPath);
+        return targetPath;
+      }
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      return null;
+    };
+
+    // 1. Try target NeoForge 21.1.267 first
+    let downloaded = await tryDownloadVersion(NEOFORGE_LOADER_VERSION);
+
+    // 2. Fallback to latest published 21.1.x from official maven-metadata.xml if 21.1.267 is unavailable
+    if (!downloaded) {
+      this.emitInstallProgress('Поиск актуальной сборки NeoForge 21.1.x в официальном Maven...', 10);
+      const metaRes = await fetch(`${NEOFORGE_MAVEN_BASE}/maven-metadata.xml`);
+      if (metaRes.ok) {
+        const xml = await metaRes.text();
+        const matches = Array.from(xml.matchAll(/<version>(21\.1\.\d+)<\/version>/g)).map((m) => m[1]);
+        const latest211 = matches.sort((a, b) => {
+          const pa = Number(a.split('.')[2] || 0);
+          const pb = Number(b.split('.')[2] || 0);
+          return pb - pa;
+        })[0];
+        if (latest211 && latest211 !== NEOFORGE_LOADER_VERSION) {
+          downloaded = await tryDownloadVersion(latest211);
+        }
+      }
+    }
+
+    if (!downloaded) {
+      throw new Error(
+        'Не удалось скачать установщик NeoForge 1.21.1 с maven.neoforged.net. Проверьте подключение к интернету.'
+      );
+    }
+
+    this.emitInstallProgress('Установщик NeoForge успешно загружен', 45);
+    return downloaded;
+  }
+
+  public async initializeServer(
+    overrideServerDir?: string
+  ): Promise<{ ok: boolean; state?: AppFullState; error?: string }> {
+    if (this.installingCore) {
+      return { ok: false, error: 'Инициализация ядра сервера уже выполняется.' };
+    }
+
+    this.installingCore = true;
+    this.installError = null;
+    this.setupPromptDismissed = true;
+
+    try {
+      const targetDir = this.resolveSafePath(overrideServerDir || this.config.serverDir);
+      this.config.serverDir = targetDir;
+      this.emitInstallProgress(`Создание структуры директории ${targetDir}...`, 5);
+
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.mkdirSync(path.join(targetDir, 'mods'), { recursive: true });
+      this.ensureEulaAccepted(targetDir);
+
+      const propsPath = path.join(targetDir, 'server.properties');
+      if (!fs.existsSync(propsPath)) {
+        fs.writeFileSync(propsPath, DEFAULT_SERVER_PROPERTIES, 'utf8');
+      }
+
+      // Check if server core already exists in targetDir
+      const existingArgs = this.findNeoForgeArgsFile(targetDir);
+      const existingJar = this.autoFindServerJar(targetDir);
+      if (existingArgs) {
+        this.config.jarFile = path.join(targetDir, existingArgs);
+        this.serverInitialized = true;
+        this.savePersistedConfig();
+        this.emitInstallProgress('Обнаружено готовое ядро NeoForge 1.21.1', 100);
+        this.appendLog('SYSTEM', 'system', `Сервер инициализирован. Найдено ядро: ${this.config.jarFile}`);
+        return { ok: true, state: this.getFullState() };
+      }
+      if (existingJar && !this.isSandboxStubJar(existingJar)) {
+        this.config.jarFile = existingJar;
+        this.serverInitialized = true;
+        this.savePersistedConfig();
+        this.emitInstallProgress(`Найдено готовое JAR-ядро: ${path.basename(existingJar)}`, 100);
+        this.appendLog('SYSTEM', 'system', `Сервер инициализирован. Найдено ядро: ${existingJar}`);
+        return { ok: true, state: this.getFullState() };
+      }
+
+      // Sandbox / Web preview mode initialization
+      if (this.environment === 'web-preview' || this.config.mode === 'sandbox') {
+        this.emitInstallProgress('Подготовка тестового ядра NeoForge 21.1.267 (песочница)...', 40);
+        await sleep(300);
+        const stubJar = path.join(targetDir, `neoforge-${NEOFORGE_LOADER_VERSION}-server.jar`);
+        fs.writeFileSync(
+          stubJar,
+          `NEOCRAFT-SANDBOX-JAR\nversion=neoforge-${NEOFORGE_MC_VERSION}-${NEOFORGE_LOADER_VERSION}\n`,
+          'utf8'
+        );
+        this.config.jarFile = stubJar;
+        this.serverInitialized = true;
+        this.emitInstallProgress('Ядро NeoForge 1.21.1 (песочница) готово к запуску', 100);
+        this.appendLog('SYSTEM', 'system', `Директория сервера инициализирована: ${targetDir}`);
+        return { ok: true, state: this.getFullState() };
+      }
+
+      // Native Electron mode: verify Java 21 + download installer + run --installServer
+      this.detectJavaInstallations(true);
+      if (!this.javaDetection.selectedPath) {
+        throw new Error(
+          'Java 21 не найдена в системе. Установите Eclipse Temurin JDK 21 (adoptium.net) и повторите инициализацию.'
+        );
+      }
+
+      const installerPath = await this.downloadNeoForgeInstaller();
+
+      this.emitInstallProgress(
+        'Установка серверных библиотек NeoForge 1.21.1 (--installServer)... Это займёт 1–2 минуты.',
+        50
+      );
+      this.appendLog(
+        'SYSTEM',
+        'system',
+        `Запуск установки ядра: "${this.config.javaPath}" -jar "${installerPath}" --installServer`
+      );
+
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn(
+          this.config.javaPath,
+          ['-jar', installerPath, '--installServer'],
+          {
+            cwd: targetDir,
+            shell: false,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          }
+        );
+
+        let progressPct = 52;
+        const onChunk = (chunk: Buffer, isErr: boolean) => {
+          const text = chunk.toString('utf8');
+          for (const rawLine of text.split(/\r?\n/)) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            this.appendLog(isErr ? 'WARN' : 'INFO', isErr ? 'stderr' : 'stdout', `[Installer] ${line}`);
+            if (progressPct < 94) {
+              progressPct = Math.min(94, progressPct + 1);
+              this.emitInstallProgress(`Установка NeoForge: ${line.slice(0, 72)}`, progressPct);
+            }
+          }
+        };
+
+        proc.stdout.on('data', (c: Buffer) => onChunk(c, false));
+        proc.stderr.on('data', (c: Buffer) => onChunk(c, true));
+        proc.on('error', (err) => reject(err));
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`Установщик NeoForge завершился с кодом ${code}.`));
+        });
+      });
+
+      this.syncAutoDetectedCorePath();
+      const verifiedArgs = this.findNeoForgeArgsFile(targetDir);
+      const verifiedJar = this.autoFindServerJar(targetDir);
+      if (verifiedArgs) {
+        this.config.jarFile = path.join(targetDir, verifiedArgs);
+      } else if (verifiedJar) {
+        this.config.jarFile = verifiedJar;
+      }
+
+      this.serverInitialized = true;
+      this.savePersistedConfig();
+      this.emitInstallProgress('Ядро NeoForge 1.21.1 установлено и выбрано автоматически!', 100);
+      this.appendLog(
+        'SYSTEM',
+        'system',
+        `Инициализация сервера завершена! Ядро подставлено автоматически: ${this.config.jarFile}`
+      );
+      return { ok: true, state: this.getFullState() };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Ошибка инициализации ядра сервера.';
+      this.appendLog('ERROR', 'system', msg);
+      this.emitInstallProgress(null, 0, msg);
+      return { ok: false, error: msg };
+    } finally {
+      this.installingCore = false;
+      this.emit('server-install-progress', this.inspectServerCore());
+    }
   }
 
   private probeJavaBinary(javaBin: string, source: string): JavaInstallation | null {
@@ -513,6 +946,7 @@ export class CoreBackendService extends EventEmitter {
       logs: [...this.logs],
       mods: this.scanMods(this.config.modsSourceDir),
       javaDetection: { ...this.javaDetection },
+      serverCore: this.inspectServerCore(),
       clientDetection: this.detectTLauncher(),
       clientSteps: this.clientSteps.map((s) => ({ ...s })),
       lastClientSetup: this.lastClientSetup ? { ...this.lastClientSetup } : null,
@@ -588,6 +1022,8 @@ export class CoreBackendService extends EventEmitter {
     next.xmxMb = nextXmx;
 
     this.config = next;
+    this.syncAutoDetectedCorePath();
+    this.savePersistedConfig();
     this.runtime.eulaAccepted = this.checkEulaAccepted(this.config.serverDir);
     this.runtime.players = this.readPlayersFromDisk(this.config.serverDir);
     return this.getFullState();
@@ -903,8 +1339,32 @@ export class CoreBackendService extends EventEmitter {
           return { ok: false, error: errMsg };
         }
 
-        const neoForgeArgsRel = this.findNeoForgeArgsFile(safeServerDir);
+        let neoForgeArgsRel = this.findNeoForgeArgsFile(safeServerDir);
         let jvmArgs: string[];
+
+        // Auto-download & install NeoForge 1.21.1 server core if missing on disk!
+        if (!neoForgeArgsRel && !fs.existsSync(safeJarPath)) {
+          const discoveredJar = this.autoFindServerJar(safeServerDir);
+          if (discoveredJar) {
+            safeJarPath = discoveredJar;
+            this.config.jarFile = discoveredJar;
+            this.appendLog('SYSTEM', 'system', `Автоматически найдено ядро сервера: ${discoveredJar}`);
+          } else {
+            this.appendLog(
+              'SYSTEM',
+              'system',
+              'Ядро сервера не найдено — запускается автоматическая загрузка и установка NeoForge 1.21.1...'
+            );
+            const initRes = await this.initializeServer(safeServerDir);
+            if (!initRes.ok) {
+              const errMsg = initRes.error || 'Не удалось автоматически установить ядро NeoForge 1.21.1.';
+              this.updateRuntimeStatus('error', errMsg);
+              return { ok: false, error: errMsg };
+            }
+            neoForgeArgsRel = this.findNeoForgeArgsFile(safeServerDir);
+            safeJarPath = this.resolveSafePath(this.config.jarFile);
+          }
+        }
 
         if (neoForgeArgsRel) {
           this.appendLog(
@@ -919,20 +1379,6 @@ export class CoreBackendService extends EventEmitter {
             'nogui',
           ];
         } else {
-          if (!fs.existsSync(safeJarPath)) {
-            const discoveredJar = this.autoFindServerJar(safeServerDir);
-            if (discoveredJar) {
-              safeJarPath = discoveredJar;
-              this.config.jarFile = discoveredJar;
-              this.appendLog('SYSTEM', 'system', `Автоматически найдено ядро сервера: ${discoveredJar}`);
-            } else {
-              const errMsg = `Ядро сервера не найдено в ${safeServerDir}. Поместите туда JAR-файл сервера (или установите NeoForge Server) либо переключите режим на «Sandbox» в сайдбаре для теста.`;
-              this.appendLog('ERROR', 'system', errMsg);
-              this.updateRuntimeStatus('error', errMsg);
-              return { ok: false, error: errMsg };
-            }
-          }
-
           jvmArgs = [
             `-Xms${this.config.xmsMb}M`,
             `-Xmx${this.config.xmxMb}M`,

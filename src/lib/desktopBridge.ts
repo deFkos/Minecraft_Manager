@@ -12,6 +12,7 @@ import type {
   NetworkSettings,
   PlayerLists,
   ServerConfig,
+  ServerCoreStatus,
   ServerRuntimeState,
   WorkspaceMode,
 } from '../../shared/types';
@@ -52,6 +53,7 @@ class WebEventBus {
       'server-log',
       'players-update',
       'client-setup-progress',
+      'server-install-progress',
     ];
 
     for (const name of eventNames) {
@@ -104,6 +106,13 @@ const webPreviewApi: DesktopAPI = {
       method: 'POST',
       body: JSON.stringify(patch),
     }),
+  initializeServer: (serverDir?: string) =>
+    apiJson<{ ok: boolean; state?: AppFullState; error?: string }>('/api/server/initialize', {
+      method: 'POST',
+      body: JSON.stringify({ serverDir }),
+    }),
+  dismissInitialSetup: () =>
+    apiJson<{ ok: boolean }>('/api/server/dismiss-setup', { method: 'POST' }),
   startServer: () =>
     apiJson<{ ok: boolean; error?: string }>('/api/server/start', { method: 'POST' }),
   stopServer: () =>
@@ -155,6 +164,8 @@ const webPreviewApi: DesktopAPI = {
   onPlayersUpdate: (cb) => webEventBus.on<PlayerLists>('players-update', cb),
   onClientSetupProgress: (cb) =>
     webEventBus.on<ClientSetupStep[]>('client-setup-progress', cb),
+  onServerInstallProgress: (cb) =>
+    webEventBus.on<ServerCoreStatus>('server-install-progress', cb),
 };
 
 export const desktopApi: DesktopAPI =

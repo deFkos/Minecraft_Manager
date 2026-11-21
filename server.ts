@@ -8,6 +8,7 @@ import type {
   LogEntry,
   PlayerLists,
   ServerConfig,
+  ServerCoreStatus,
   ServerRuntimeState,
   WorkspaceMode,
 } from './shared/types.ts';
@@ -41,6 +42,9 @@ async function bootstrap(): Promise<void> {
   });
   coreService.on('client-setup-progress', (steps: ClientSetupStep[]) => {
     broadcastEvent('client-setup-progress', steps);
+  });
+  coreService.on('server-install-progress', (status: ServerCoreStatus) => {
+    broadcastEvent('server-install-progress', status);
   });
 
   app.get('/api/events', (req: Request, res: Response) => {
@@ -89,6 +93,20 @@ async function bootstrap(): Promise<void> {
   app.post(
     '/api/server/config',
     handleRoute((req) => coreService.updateServerConfig((req.body || {}) as Partial<ServerConfig>))
+  );
+
+  app.post(
+    '/api/server/initialize',
+    handleRoute((req) =>
+      coreService.initializeServer(
+        typeof req.body?.serverDir === 'string' ? req.body.serverDir : undefined
+      )
+    )
+  );
+
+  app.post(
+    '/api/server/dismiss-setup',
+    handleRoute(() => coreService.dismissInitialSetup())
   );
 
   app.post(
