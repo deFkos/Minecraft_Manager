@@ -1,6 +1,9 @@
 node_modules/
 build/
 dist/
+dist-electron/
+release/
+.neocraft-sandbox/
 coverage/
 .DS_Store
 *.log

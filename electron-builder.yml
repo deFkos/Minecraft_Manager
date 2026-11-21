@@ -3,7 +3,7 @@ productName: NeoCraft Control
 copyright: Copyright © 2026 NeoCraft Control
 directories:
   output: release
-  buildResources: build
+  buildResources: electron-resources
 files:
   - dist/**/*
   - dist-electron/**/*
@@ -16,7 +16,7 @@ win:
     - target: nsis
       arch:
         - x64
-  icon: build/icon.png
+  icon: electron-resources/icon.png
   signAndEditExecutable: false
   artifactName: NeoCraft-Control-Setup-${version}.${ext}
 nsis:
@@ -31,7 +31,7 @@ nsis:
     - ru_RU
     - en_US
   language: "1049"
-  include: build/installer.nsh
+  include: electron-resources/installer.nsh
 linux:
   target:
     - target: AppImage
@@ -40,6 +40,6 @@ linux:
     - target: deb
       arch:
         - x64
-  icon: build/icon.png
+  icon: electron-resources/icon.png
   category: Utility
   artifactName: NeoCraft-Control-${version}.${ext}
