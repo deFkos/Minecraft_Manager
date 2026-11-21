@@ -122,8 +122,15 @@ export class CoreBackendService extends EventEmitter {
   constructor(environment: RuntimeEnvironment, projectRoot = process.cwd()) {
     super();
     this.environment = environment;
-    this.sandboxRoot = path.resolve(projectRoot, '.neocraft-sandbox');
-    this.runnerScriptPath = path.resolve(projectRoot, 'backend', 'sandboxRunner.mjs');
+    const isPackagedAsar = projectRoot.includes('app.asar');
+    const unpackedRoot = isPackagedAsar
+      ? projectRoot.replace('app.asar', 'app.asar.unpacked')
+      : projectRoot;
+    this.sandboxRoot =
+      environment === 'electron' && isPackagedAsar
+        ? path.join(os.homedir(), '.neocraft-control', 'sandbox')
+        : path.resolve(projectRoot, '.neocraft-sandbox');
+    this.runnerScriptPath = path.resolve(unpackedRoot, 'backend', 'sandboxRunner.mjs');
 
     this.ensureSandboxWorkspace();
 

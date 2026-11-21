@@ -2,14 +2,21 @@
   "name": "neocraft-control",
   "private": true,
   "version": "1.0.0",
+  "description": "Менеджер сервера Minecraft и автоустановщик клиента TLauncher (NeoForge 1.21.1)",
+  "author": "NeoCraft Control",
   "type": "module",
+  "main": "dist-electron/main.mjs",
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
     "build": "vite build",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "clean": "rm -rf dist dist-electron release server.js",
+    "lint": "tsc --noEmit",
+    "electron:compile": "node scripts/build-electron.mjs --compile-only",
+    "electron:build:win": "node scripts/build-electron.mjs --target=win",
+    "electron:build:linux": "node scripts/build-electron.mjs --target=linux",
+    "electron:build": "node scripts/build-electron.mjs --target=current"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
