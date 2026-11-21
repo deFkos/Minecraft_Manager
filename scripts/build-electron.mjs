@@ -80,7 +80,7 @@ async function main() {
   }
 
   // 4. Invoke electron-builder for target platform(s)
-  const builderArgs = ['electron-builder', '--config', 'electron-builder.yml'];
+  const builderArgs = ['electron-builder', '--config', 'electron-builder.yml', '--publish', 'never'];
   if (targetArg === 'win') {
     builderArgs.push('--win', 'nsis');
   } else if (targetArg === 'linux') {

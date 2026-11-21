@@ -1,6 +1,7 @@
 appId: com.neocraft.control
 productName: NeoCraft Control
 copyright: Copyright © 2026 NeoCraft Control
+publish: null
 directories:
   output: release
   buildResources: electron-resources
