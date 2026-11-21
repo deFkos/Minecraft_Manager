@@ -126,6 +126,7 @@ export class CoreBackendService extends EventEmitter {
   private readonly appDataRoot: string;
   private readonly configFilePath: string;
   private readonly installerCacheDir: string;
+  private readonly activePidFilePath: string;
   private serverInitialized = false;
   private setupPromptDismissed = false;
   private installingCore = false;
@@ -146,6 +147,7 @@ export class CoreBackendService extends EventEmitter {
         : path.resolve(projectRoot, '.neocraft-sandbox', '.neocraft-meta');
     this.configFilePath = path.join(this.appDataRoot, 'config.json');
     this.installerCacheDir = path.join(this.appDataRoot, 'cache');
+    this.activePidFilePath = path.join(this.appDataRoot, 'active-server.pid');
 
     this.sandboxRoot =
       environment === 'electron' && isPackagedAsar
@@ -154,6 +156,7 @@ export class CoreBackendService extends EventEmitter {
     this.runnerScriptPath = path.resolve(unpackedRoot, 'backend', 'sandboxRunner.mjs');
 
     this.ensureSandboxWorkspace();
+    this.cleanupStaleServerProcess();
 
     const defaultMode: WorkspaceMode = environment === 'electron' ? 'native' : 'sandbox';
     this.config = this.buildDefaultConfig(defaultMode);
@@ -171,6 +174,108 @@ export class CoreBackendService extends EventEmitter {
       lastError: null,
       players: this.readPlayersFromDisk(this.config.serverDir),
     };
+  }
+
+  private writeActivePidFile(pid: number, port: number, serverDir: string): void {
+    try {
+      fs.mkdirSync(this.appDataRoot, { recursive: true });
+      fs.writeFileSync(
+        this.activePidFilePath,
+        JSON.stringify({ pid, port, serverDir, startedAt: new Date().toISOString() }),
+        'utf8'
+      );
+    } catch {
+      // non-fatal
+    }
+  }
+
+  private clearActivePidFile(): void {
+    try {
+      if (fs.existsSync(this.activePidFilePath)) {
+        fs.unlinkSync(this.activePidFilePath);
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  private killProcessTreeSync(pid: number): void {
+    if (!Number.isInteger(pid) || pid <= 0) return;
+    try {
+      if (process.platform === 'win32') {
+        spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          shell: false,
+          stdio: 'ignore',
+          windowsHide: true,
+          timeout: 4000,
+        });
+      } else {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch {
+          // already exited
+        }
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // already exited
+        }
+      }
+    } catch {
+      // ignore if process already gone
+    }
+  }
+
+  private cleanupStaleServerProcess(): void {
+    try {
+      if (!fs.existsSync(this.activePidFilePath)) return;
+      const raw = JSON.parse(fs.readFileSync(this.activePidFilePath, 'utf8')) as {
+        pid?: number;
+        port?: number;
+      };
+      if (typeof raw.pid === 'number' && raw.pid > 0 && raw.pid !== process.pid) {
+        let alive = false;
+        try {
+          process.kill(raw.pid, 0);
+          alive = true;
+        } catch {
+          alive = false;
+        }
+        if (alive) {
+          this.killProcessTreeSync(raw.pid);
+        }
+      }
+    } catch {
+      // ignore malformed pid file
+    } finally {
+      this.clearActivePidFile();
+    }
+  }
+
+  private getLocalInterfaceIps(): string[] {
+    const ips = new Set<string>(['127.0.0.1', '0.0.0.0']);
+    try {
+      const ifaces = os.networkInterfaces();
+      for (const entries of Object.values(ifaces)) {
+        if (!entries) continue;
+        for (const info of entries) {
+          if (info.family === 'IPv4' && info.address) {
+            ips.add(info.address);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return Array.from(ips);
+  }
+
+  private isBindableLocalIp(ip: string): boolean {
+    const cleaned = ip.trim().toLowerCase();
+    if (!cleaned || cleaned === '0.0.0.0' || cleaned === '127.0.0.1' || cleaned === 'localhost' || cleaned === '::') {
+      return true;
+    }
+    return this.getLocalInterfaceIps().includes(cleaned);
   }
 
   private loadPersistedConfig(): void {
@@ -1102,6 +1207,7 @@ export class CoreBackendService extends EventEmitter {
       fileExists: true,
       rawPreview: content,
       otherKeysCount,
+      localIps: this.getLocalInterfaceIps(),
     };
   }
 
@@ -1276,6 +1382,8 @@ export class CoreBackendService extends EventEmitter {
     }
 
     try {
+      this.cleanupStaleServerProcess();
+
       const safeServerDir = this.resolveSafePath(this.config.serverDir);
       let safeJarPath = this.resolveSafePath(this.config.jarFile);
       fs.mkdirSync(safeServerDir, { recursive: true });
@@ -1285,6 +1393,19 @@ export class CoreBackendService extends EventEmitter {
         this.appendLog('SYSTEM', 'system', `Создан файл eula.txt (eula=true) в ${safeServerDir}`);
       } else {
         this.appendLog('SYSTEM', 'system', 'Проверка eula.txt пройдена (eula=true).');
+      }
+
+      // Prevent BindException ("Cannot assign requested address: bind") if an external router WAN IP
+      // was entered into server-ip instead of a local adapter / VPN IP.
+      const netProps = this.readNetworkProperties();
+      const configuredIp = netProps.serverIp.trim();
+      if (configuredIp && !this.isBindableLocalIp(configuredIp)) {
+        this.saveNetworkProperties('', netProps.serverPort);
+        this.appendLog(
+          'WARN',
+          'system',
+          `IP ${configuredIp} не принадлежит локальным сетевым адаптерам ПК (внешний IP роутера/NAT). Чтобы избежать BindException, server-ip переключён на 0.0.0.0 (все интерфейсы). Друзья по-прежнему подключаются по ${configuredIp}:${netProps.serverPort}.`
+        );
       }
 
       const useSandboxRunner =
@@ -1398,6 +1519,10 @@ export class CoreBackendService extends EventEmitter {
 
       this.childProc = child;
       this.runtime.pid = child.pid ?? null;
+      if (child.pid) {
+        const currentPort = this.readNetworkProperties().serverPort;
+        this.writeActivePidFile(child.pid, currentPort, safeServerDir);
+      }
       this.emit('server-status', { ...this.runtime });
 
       const handleStreamChunk = (chunk: Buffer, source: 'stdout' | 'stderr') => {
@@ -1428,6 +1553,7 @@ export class CoreBackendService extends EventEmitter {
       child.on('error', (err) => {
         this.childProc = null;
         this.runtime.pid = null;
+        this.clearActivePidFile();
         this.appendLog('ERROR', 'system', `Ошибка запуска процесса: ${err.message}`);
         this.updateRuntimeStatus('error', err.message);
       });
@@ -1437,8 +1563,9 @@ export class CoreBackendService extends EventEmitter {
         this.childProc = null;
         this.runtime.pid = null;
         this.runtime.startedAt = null;
+        this.clearActivePidFile();
         if (code === 0 || code === null || wasStopping) {
-          this.appendLog('SYSTEM', 'system', `Процесс сервера остановлен (код выхода: ${code ?? 0}).`);
+          this.appendLog('SYSTEM', 'system', `Процесс сервера остановлен и порт освобождён (код выхода: ${code ?? 0}).`);
           this.updateRuntimeStatus('offline', null);
         } else {
           const errMsg = `Сервер завершился аварийно с кодом ${code}.`;
@@ -1456,14 +1583,51 @@ export class CoreBackendService extends EventEmitter {
     }
   }
 
+  /**
+   * Synchronous emergency cleanup for process exit / crashes / SIGINT / SIGTERM / Alt+F4.
+   * Guarantees the Java server process tree is terminated and the port is immediately unbound.
+   */
+  public forceKillServerSync(): void {
+    const pid = this.childProc?.pid ?? this.runtime.pid;
+    if (pid) {
+      this.killProcessTreeSync(pid);
+    }
+    if (this.childProc) {
+      try {
+        this.childProc.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      this.childProc = null;
+    }
+    this.runtime.pid = null;
+    this.runtime.startedAt = null;
+    this.cleanupStaleServerProcess();
+  }
+
+  /**
+   * Graceful shutdown with guaranteed force-kill fallback to ensure the server port is always released.
+   */
+  public async shutdownAndReleasePort(): Promise<void> {
+    try {
+      if (this.childProc) {
+        await this.stopServer();
+      }
+    } finally {
+      this.forceKillServerSync();
+    }
+  }
+
   public async stopServer(): Promise<{ ok: boolean; error?: string }> {
     const proc = this.childProc;
     if (!proc) {
+      this.cleanupStaleServerProcess();
       this.updateRuntimeStatus('offline', null);
       return { ok: true };
     }
 
-    this.appendLog('SYSTEM', 'system', 'Отправка команды остановки (stop)...');
+    const pid = proc.pid;
+    this.appendLog('SYSTEM', 'system', 'Отправка команды остановки (stop) и освобождение порта...');
 
     return new Promise((resolve) => {
       let settled = false;
@@ -1471,6 +1635,7 @@ export class CoreBackendService extends EventEmitter {
         if (settled) return;
         settled = true;
         clearTimeout(killTimer);
+        this.clearActivePidFile();
         resolve({ ok: true });
       };
 
@@ -1479,16 +1644,29 @@ export class CoreBackendService extends EventEmitter {
       try {
         proc.stdin.write('stop\n');
       } catch {
-        proc.kill('SIGTERM');
+        if (pid) this.killProcessTreeSync(pid);
+        else proc.kill('SIGTERM');
       }
 
       const killTimer = setTimeout(() => {
         if (this.childProc === proc) {
-          this.appendLog('WARN', 'system', 'Превышено время ожидания остановки, принудительное завершение (SIGTERM).');
-          proc.kill('SIGTERM');
+          this.appendLog(
+            'WARN',
+            'system',
+            'Превышено время ожидания остановки — принудительное завершение дерева процессов для освобождения порта.'
+          );
+          if (pid) {
+            this.killProcessTreeSync(pid);
+          } else {
+            proc.kill('SIGKILL');
+          }
+          this.childProc = null;
+          this.runtime.pid = null;
+          this.runtime.startedAt = null;
+          this.updateRuntimeStatus('offline', null);
         }
         finish();
-      }, 5000);
+      }, 4500);
     });
   }
 

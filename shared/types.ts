@@ -33,6 +33,7 @@ export interface NetworkSettings {
   fileExists: boolean;
   rawPreview: string;
   otherKeysCount: number;
+  localIps?: string[];
 }
 
 export interface ModFileInfo {

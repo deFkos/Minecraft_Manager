@@ -33,10 +33,16 @@ declare module 'electron' {
     static getAllWindows(): BrowserWindow[];
   }
 
+  export interface ElectronEvent {
+    preventDefault(): void;
+  }
+
   export const app: {
     whenReady(): Promise<void>;
+    on(event: 'before-quit', listener: (event: ElectronEvent) => void): void;
     on(event: string, listener: (...args: unknown[]) => void): void;
     quit(): void;
+    exit(exitCode?: number): void;
     getAppPath(): string;
     requestSingleInstanceLock(): boolean;
     isPackaged: boolean;

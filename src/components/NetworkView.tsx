@@ -46,18 +46,28 @@ export function NetworkView({ network, onSaveNetwork, onToast }: NetworkViewProp
 
   const isValid = !ipError && !portError;
   const parsedPort = Number(portText.trim()) || 25565;
-  const displayAddress = `${serverIp.trim() || '127.0.0.1'}:${parsedPort}`;
+  const trimmedIp = serverIp.trim();
+  const displayAddress = `${trimmedIp || '127.0.0.1'}:${parsedPort}`;
+
+  const localIps = network.localIps ?? [];
+  const isNonLocalExternalIp = useMemo(() => {
+    if (!trimmedIp || ipError) return false;
+    const lower = trimmedIp.toLowerCase();
+    if (lower === '0.0.0.0' || lower === '127.0.0.1' || lower === 'localhost') return false;
+    if (localIps.length === 0) return false;
+    return !localIps.includes(trimmedIp);
+  }, [trimmedIp, ipError, localIps]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isValid) return;
     setSaving(true);
     try {
-      await onSaveNetwork(serverIp.trim(), parsedPort);
+      await onSaveNetwork(trimmedIp, parsedPort);
       onToast(
         'success',
         'server.properties обновлен',
-        `Сохранены значения server-ip=${serverIp.trim() || '(все)'} и server-port=${parsedPort}`
+        `Сохранены значения server-ip=${trimmedIp || '(все)'} и server-port=${parsedPort}`
       );
     } finally {
       setSaving(false);
@@ -114,19 +124,57 @@ export function NetworkView({ network, onSaveNetwork, onToast }: NetworkViewProp
                 type="text"
                 value={serverIp}
                 onChange={(e) => setServerIp(e.target.value)}
-                placeholder="Пусто (0.0.0.0) или например 26.114.52.18"
+                placeholder="Пусто (0.0.0.0 — рекомендуется) или IP Radmin VPN"
                 className={`w-full px-3.5 py-2.5 rounded-lg bg-[#0B1120] border text-sm font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none transition-colors ${
                   ipError
                     ? 'border-red-500/70 focus:border-red-400'
-                    : 'border-slate-800 focus:border-indigo-500'
+                    : isNonLocalExternalIp
+                      ? 'border-amber-500/60 focus:border-amber-400'
+                      : 'border-slate-800 focus:border-indigo-500'
                 }`}
               />
               {ipError ? (
                 <p className="text-xs text-red-400">{ipError}</p>
+              ) : isNonLocalExternalIp ? (
+                <p className="text-xs text-amber-300 leading-relaxed">
+                  Внимание: IP <span className="font-mono">{trimmedIp}</span> не найден на сетевых адаптерах ПК (это внешний IP роутера). При старте сервер автоматически переключит <span className="font-mono">server-ip</span> на <span className="font-mono">0.0.0.0</span>, чтобы избежать ошибки <span className="font-mono">BindException</span> — друзья смогут подключаться по <span className="font-mono">{displayAddress}</span>.
+                </p>
               ) : (
                 <p className="text-xs text-slate-500">
-                  Оставьте пустым для прослушивания всех сетевых интерфейсов, либо укажите IP Radmin VPN / выделенный IP.
+                  Оставьте пустым (<span className="font-mono">0.0.0.0</span>) для прослушивания всех сетевых интерфейсов, либо выберите локальный/VPN IP ниже.
                 </p>
+              )}
+
+              {localIps.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setServerIp('')}
+                    className={`px-2 py-0.5 rounded text-[11px] font-mono border transition-colors ${
+                      trimmedIp === ''
+                        ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-200'
+                        : 'bg-[#0B1120] border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Все (0.0.0.0)
+                  </button>
+                  {localIps
+                    .filter((ip) => ip !== '0.0.0.0' && ip !== '127.0.0.1')
+                    .map((ip) => (
+                      <button
+                        key={ip}
+                        type="button"
+                        onClick={() => setServerIp(ip)}
+                        className={`px-2 py-0.5 rounded text-[11px] font-mono border transition-colors ${
+                          trimmedIp === ip
+                            ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-200'
+                            : 'bg-[#0B1120] border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {ip}
+                      </button>
+                    ))}
+                </div>
               )}
             </div>
 

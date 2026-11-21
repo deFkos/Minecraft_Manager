@@ -217,8 +217,25 @@ async function bootstrap(): Promise<void> {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[NeoCraft Control] Full-stack server listening on http://0.0.0.0:${PORT}`);
+  });
+
+  let shuttingDown = false;
+  const handleShutdownSignal = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void coreService.shutdownAndReleasePort().finally(() => {
+      httpServer.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1500).unref();
+    });
+  };
+
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.on(sig, handleShutdownSignal);
+  }
+  process.on('exit', () => {
+    coreService.forceKillServerSync();
   });
 }
 

@@ -190,14 +190,53 @@ if (!gotSingleInstanceLock) {
   });
 }
 
-app.on('window-all-closed', () => {
-  if (coreService) {
-    void coreService.stopServer().finally(() => {
-      if (process.platform !== 'darwin') {
-        app.quit();
-      }
-    });
-  } else if (process.platform !== 'darwin') {
-    app.quit();
+let isQuitting = false;
+
+async function gracefulAppShutdown(): Promise<void> {
+  if (!coreService) return;
+  try {
+    await Promise.race([
+      coreService.shutdownAndReleasePort(),
+      new Promise<void>((resolve) => setTimeout(resolve, 6000)),
+    ]);
+  } finally {
+    coreService.forceKillServerSync();
   }
+}
+
+app.on('before-quit', (event) => {
+  if (isQuitting) return;
+  isQuitting = true;
+  event.preventDefault();
+  void gracefulAppShutdown().finally(() => {
+    app.exit(0);
+  });
+});
+
+app.on('will-quit', () => {
+  coreService?.forceKillServerSync();
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  } else {
+    void gracefulAppShutdown();
+  }
+});
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  process.on(signal, () => {
+    coreService?.forceKillServerSync();
+    process.exit(0);
+  });
+}
+
+process.on('exit', () => {
+  coreService?.forceKillServerSync();
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[NeoCraft Control] Uncaught exception:', err);
+  coreService?.forceKillServerSync();
 });
