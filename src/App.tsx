@@ -139,6 +139,8 @@ export default function App() {
     setBusyAction('start');
     try {
       const res = await desktopApi.startServer();
+      const refreshed = await desktopApi.getState();
+      setState(refreshed);
       if (!res.ok) {
         pushToast('error', 'Не удалось запустить сервер', res.error);
       }
@@ -153,6 +155,8 @@ export default function App() {
     setBusyAction('stop');
     try {
       const res = await desktopApi.stopServer();
+      const refreshed = await desktopApi.getState();
+      setState(refreshed);
       if (!res.ok) {
         pushToast('error', 'Не удалось остановить сервер', res.error);
       }
@@ -167,6 +171,8 @@ export default function App() {
     setBusyAction('restart');
     try {
       const res = await desktopApi.restartServer();
+      const refreshed = await desktopApi.getState();
+      setState(refreshed);
       if (!res.ok) {
         pushToast('error', 'Не удалось перезапустить сервер', res.error);
       }

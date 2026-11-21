@@ -133,6 +133,17 @@ export class CoreBackendService extends EventEmitter {
   private installStage: string | null = null;
   private installPercent = 0;
   private installError: string | null = null;
+  private networkPrefs: {
+    shareIp: string;
+    bindIp: string;
+    serverPort: number;
+    hasSavedNetwork: boolean;
+  } = {
+    shareIp: '',
+    bindIp: '',
+    serverPort: 25565,
+    hasSavedNetwork: false,
+  };
 
   constructor(environment: RuntimeEnvironment, projectRoot = process.cwd()) {
     super();
@@ -284,18 +295,31 @@ export class CoreBackendService extends EventEmitter {
       const raw = JSON.parse(fs.readFileSync(this.configFilePath, 'utf8')) as {
         config?: Partial<ServerConfig>;
         serverInitialized?: boolean;
+        setupPromptDismissed?: boolean;
+        networkPrefs?: {
+          shareIp?: string;
+          bindIp?: string;
+          serverPort?: number;
+          hasSavedNetwork?: boolean;
+        };
       };
-      if (raw.config && this.environment === 'electron') {
-        if (typeof raw.config.serverDir === 'string' && raw.config.serverDir.trim()) {
+      if (raw.config) {
+        const allowPath = (p: string) => {
+          if (this.environment === 'electron') return true;
+          const root = path.resolve(this.sandboxRoot);
+          const resolved = path.resolve(p);
+          return resolved === root || resolved.startsWith(root + path.sep);
+        };
+        if (typeof raw.config.serverDir === 'string' && raw.config.serverDir.trim() && allowPath(raw.config.serverDir.trim())) {
           this.config.serverDir = raw.config.serverDir.trim();
         }
-        if (typeof raw.config.jarFile === 'string' && raw.config.jarFile.trim()) {
+        if (typeof raw.config.jarFile === 'string' && raw.config.jarFile.trim() && allowPath(raw.config.jarFile.trim())) {
           this.config.jarFile = raw.config.jarFile.trim();
         }
-        if (typeof raw.config.modsSourceDir === 'string' && raw.config.modsSourceDir.trim()) {
+        if (typeof raw.config.modsSourceDir === 'string' && raw.config.modsSourceDir.trim() && allowPath(raw.config.modsSourceDir.trim())) {
           this.config.modsSourceDir = raw.config.modsSourceDir.trim();
         }
-        if (typeof raw.config.minecraftDir === 'string' && raw.config.minecraftDir.trim()) {
+        if (typeof raw.config.minecraftDir === 'string' && raw.config.minecraftDir.trim() && allowPath(raw.config.minecraftDir.trim())) {
           this.config.minecraftDir = raw.config.minecraftDir.trim();
         }
         if (typeof raw.config.clientBuildName === 'string' && raw.config.clientBuildName.trim()) {
@@ -311,6 +335,28 @@ export class CoreBackendService extends EventEmitter {
       if (typeof raw.serverInitialized === 'boolean') {
         this.serverInitialized = raw.serverInitialized;
       }
+      if (typeof raw.setupPromptDismissed === 'boolean') {
+        this.setupPromptDismissed = raw.setupPromptDismissed;
+      }
+      if (raw.networkPrefs && typeof raw.networkPrefs === 'object') {
+        if (typeof raw.networkPrefs.shareIp === 'string') {
+          this.networkPrefs.shareIp = raw.networkPrefs.shareIp.trim();
+        }
+        if (typeof raw.networkPrefs.bindIp === 'string') {
+          this.networkPrefs.bindIp = raw.networkPrefs.bindIp.trim();
+        }
+        if (
+          typeof raw.networkPrefs.serverPort === 'number' &&
+          Number.isInteger(raw.networkPrefs.serverPort) &&
+          raw.networkPrefs.serverPort >= 1 &&
+          raw.networkPrefs.serverPort <= 65535
+        ) {
+          this.networkPrefs.serverPort = raw.networkPrefs.serverPort;
+        }
+        if (typeof raw.networkPrefs.hasSavedNetwork === 'boolean') {
+          this.networkPrefs.hasSavedNetwork = raw.networkPrefs.hasSavedNetwork;
+        }
+      }
     } catch {
       // ignore corrupted config file
     }
@@ -325,6 +371,8 @@ export class CoreBackendService extends EventEmitter {
           {
             config: this.config,
             serverInitialized: this.serverInitialized,
+            setupPromptDismissed: this.setupPromptDismissed,
+            networkPrefs: this.networkPrefs,
           },
           null,
           2
@@ -451,6 +499,7 @@ export class CoreBackendService extends EventEmitter {
 
   public dismissInitialSetup(): { ok: boolean } {
     this.setupPromptDismissed = true;
+    this.savePersistedConfig();
     return { ok: true };
   }
 
@@ -569,6 +618,9 @@ export class CoreBackendService extends EventEmitter {
       const propsPath = path.join(targetDir, 'server.properties');
       if (!fs.existsSync(propsPath)) {
         fs.writeFileSync(propsPath, DEFAULT_SERVER_PROPERTIES, 'utf8');
+        if (this.networkPrefs.hasSavedNetwork) {
+          this.saveNetworkProperties(this.networkPrefs.shareIp, this.networkPrefs.serverPort);
+        }
       }
 
       // Check if server core already exists in targetDir
@@ -1072,6 +1124,11 @@ export class CoreBackendService extends EventEmitter {
       await this.stopServer();
     }
     this.config = this.buildDefaultConfig(mode);
+    if (mode === 'native') {
+      this.loadPersistedConfig();
+      this.config.mode = 'native';
+      this.syncAutoDetectedCorePath();
+    }
     if (this.javaDetection.selectedPath) {
       this.config.javaPath = this.javaDetection.selectedPath;
     }
@@ -1164,21 +1221,27 @@ export class CoreBackendService extends EventEmitter {
   public readNetworkProperties(): NetworkSettings {
     const safeServerDir = this.resolveSafePath(this.config.serverDir);
     const propsPath = path.join(safeServerDir, 'server.properties');
+    const localIps = this.getLocalInterfaceIps();
 
     if (!fs.existsSync(propsPath)) {
+      const rememberedIp = this.networkPrefs.hasSavedNetwork ? this.networkPrefs.shareIp : '';
+      const rememberedPort = this.networkPrefs.hasSavedNetwork ? this.networkPrefs.serverPort : 25565;
       return {
-        serverIp: '',
-        serverPort: 25565,
+        serverIp: rememberedIp,
+        shareIp: rememberedIp,
+        bindIp: this.networkPrefs.bindIp,
+        serverPort: rememberedPort,
         propertiesPath: propsPath,
         fileExists: false,
         rawPreview: '# Файл server.properties еще не создан. Он будет создан автоматически при сохранении.',
         otherKeysCount: 0,
+        localIps,
       };
     }
 
     const content = fs.readFileSync(propsPath, 'utf8');
-    let serverIp = '';
-    let serverPort = 25565;
+    let fileServerIp = '';
+    let serverPort = this.networkPrefs.hasSavedNetwork ? this.networkPrefs.serverPort : 25565;
     let otherKeysCount = 0;
 
     for (const line of content.split(/\r?\n/)) {
@@ -1189,7 +1252,7 @@ export class CoreBackendService extends EventEmitter {
       const key = trimmed.slice(0, eqIdx).trim();
       const val = trimmed.slice(eqIdx + 1).trim();
       if (key === 'server-ip') {
-        serverIp = val;
+        fileServerIp = val;
       } else if (key === 'server-port') {
         const parsed = Number.parseInt(val, 10);
         if (!Number.isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
@@ -1200,34 +1263,25 @@ export class CoreBackendService extends EventEmitter {
       }
     }
 
+    // If fileServerIp is empty (bound to 0.0.0.0) because user configured an external WAN IP,
+    // keep exposing their saved shareIp so it never vanishes from the UI or "Copy for friends".
+    const effectiveShareIp =
+      fileServerIp || (this.networkPrefs.hasSavedNetwork ? this.networkPrefs.shareIp : '');
+
     return {
-      serverIp,
+      serverIp: effectiveShareIp,
+      shareIp: effectiveShareIp,
+      bindIp: fileServerIp,
       serverPort,
       propertiesPath: propsPath,
       fileExists: true,
       rawPreview: content,
       otherKeysCount,
-      localIps: this.getLocalInterfaceIps(),
+      localIps,
     };
   }
 
-  public saveNetworkProperties(rawIp: string, rawPort: number): NetworkSettings {
-    const ip = (rawIp ?? '').trim();
-    const port = Number(rawPort);
-
-    if (ip.length > 0) {
-      const ipv4Regex =
-        /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
-      const hostRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
-      if (!ipv4Regex.test(ip) && !hostRegex.test(ip)) {
-        throw new Error('Введите корректный IPv4-адрес, домен или оставьте поле пустым (0.0.0.0).');
-      }
-    }
-
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error('Порт должен быть целым числом от 1 до 65535.');
-    }
-
+  private writeServerPropertiesIpPort(bindIp: string, port: number): void {
     const safeServerDir = this.resolveSafePath(this.config.serverDir);
     fs.mkdirSync(safeServerDir, { recursive: true });
     const propsPath = path.join(safeServerDir, 'server.properties');
@@ -1248,7 +1302,7 @@ export class CoreBackendService extends EventEmitter {
       const key = trimmed.slice(0, eqIdx).trim();
       if (key === 'server-ip') {
         updatedIp = true;
-        return `server-ip=${ip}`;
+        return `server-ip=${bindIp}`;
       }
       if (key === 'server-port') {
         updatedPort = true;
@@ -1257,17 +1311,58 @@ export class CoreBackendService extends EventEmitter {
       return line;
     });
 
-    if (!updatedIp) nextLines.push(`server-ip=${ip}`);
+    if (!updatedIp) nextLines.push(`server-ip=${bindIp}`);
     if (!updatedPort) nextLines.push(`server-port=${port}`);
 
     const finalContent = `${nextLines.join('\n').replace(/\n+$/, '')}\n`;
     fs.writeFileSync(propsPath, finalContent, 'utf8');
+  }
 
-    this.appendLog(
-      'SYSTEM',
-      'system',
-      `Обновлен server.properties: server-ip=${ip || '(все интерфейсы)'}, server-port=${port}`
-    );
+  public saveNetworkProperties(rawIp: string, rawPort: number): NetworkSettings {
+    const ip = (rawIp ?? '').trim();
+    const port = Number(rawPort);
+
+    if (ip.length > 0) {
+      const ipv4Regex =
+        /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+      const hostRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+      if (!ipv4Regex.test(ip) && !hostRegex.test(ip)) {
+        throw new Error('Введите корректный IPv4-адрес, домен или оставьте поле пустым (0.0.0.0).');
+      }
+    }
+
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error('Порт должен быть целым числом от 1 до 65535.');
+    }
+
+    // If user entered an external WAN/router IP not assigned to a local adapter,
+    // persist it as shareIp (for UI + "Copy for friends") while writing server-ip= (0.0.0.0)
+    // to server.properties so Minecraft binds cleanly without BindException!
+    const isLocalBindable = this.isBindableLocalIp(ip);
+    const bindIp = isLocalBindable ? ip : '';
+
+    this.networkPrefs = {
+      shareIp: ip,
+      bindIp,
+      serverPort: port,
+      hasSavedNetwork: true,
+    };
+    this.savePersistedConfig();
+    this.writeServerPropertiesIpPort(bindIp, port);
+
+    if (!isLocalBindable && ip) {
+      this.appendLog(
+        'SYSTEM',
+        'system',
+        `Сохранено: адрес для друзей ${ip}:${port}, а в server.properties записан server-ip= (0.0.0.0) и server-port=${port} для запуска без BindException.`
+      );
+    } else {
+      this.appendLog(
+        'SYSTEM',
+        'system',
+        `Обновлен server.properties: server-ip=${bindIp || '(все интерфейсы)'}, server-port=${port}`
+      );
+    }
 
     return this.readNetworkProperties();
   }
@@ -1395,18 +1490,31 @@ export class CoreBackendService extends EventEmitter {
         this.appendLog('SYSTEM', 'system', 'Проверка eula.txt пройдена (eula=true).');
       }
 
-      // Prevent BindException ("Cannot assign requested address: bind") if an external router WAN IP
-      // was entered into server-ip instead of a local adapter / VPN IP.
+      // Preserve user's saved IP+Port permanently while ensuring server.properties has a bindable IP
       const netProps = this.readNetworkProperties();
-      const configuredIp = netProps.serverIp.trim();
-      if (configuredIp && !this.isBindableLocalIp(configuredIp)) {
-        this.saveNetworkProperties('', netProps.serverPort);
+      const fileBindIp = (netProps.bindIp ?? '').trim();
+      if (!netProps.fileExists && this.networkPrefs.hasSavedNetwork) {
+        this.writeServerPropertiesIpPort(this.networkPrefs.bindIp, this.networkPrefs.serverPort);
+      } else if (fileBindIp && !this.isBindableLocalIp(fileBindIp)) {
+        // Remember the user's external WAN IP in shareIp BEFORE setting server-ip= (0.0.0.0) in server.properties!
+        this.networkPrefs = {
+          shareIp: fileBindIp,
+          bindIp: '',
+          serverPort: netProps.serverPort,
+          hasSavedNetwork: true,
+        };
+        this.savePersistedConfig();
+        this.writeServerPropertiesIpPort('', netProps.serverPort);
         this.appendLog(
           'WARN',
           'system',
-          `IP ${configuredIp} не принадлежит локальным сетевым адаптерам ПК (внешний IP роутера/NAT). Чтобы избежать BindException, server-ip переключён на 0.0.0.0 (все интерфейсы). Друзья по-прежнему подключаются по ${configuredIp}:${netProps.serverPort}.`
+          `IP ${fileBindIp} сохранён как адрес для друзей (${fileBindIp}:${netProps.serverPort}), а server-ip переключён на 0.0.0.0 для запуска без BindException.`
         );
+      } else if (this.networkPrefs.hasSavedNetwork && netProps.serverPort !== this.networkPrefs.serverPort) {
+        this.writeServerPropertiesIpPort(this.networkPrefs.bindIp, this.networkPrefs.serverPort);
       }
+
+      this.savePersistedConfig();
 
       const useSandboxRunner =
         this.environment === 'web-preview' ||
@@ -1703,6 +1811,10 @@ export class CoreBackendService extends EventEmitter {
 
   public scanMods(overrideSourceDir?: string): ModsState {
     const sourceDir = this.resolveSafePath(overrideSourceDir || this.config.modsSourceDir);
+    if (overrideSourceDir && sourceDir !== this.config.modsSourceDir) {
+      this.config.modsSourceDir = sourceDir;
+      this.savePersistedConfig();
+    }
     const serverModsDir = path.join(this.resolveSafePath(this.config.serverDir), 'mods');
 
     const readJarDir = (dir: string): Map<string, fs.Stats> => {
@@ -1754,6 +1866,7 @@ export class CoreBackendService extends EventEmitter {
     const sourceDir = this.resolveSafePath(overrideSourceDir || this.config.modsSourceDir);
     if (overrideSourceDir) {
       this.config.modsSourceDir = sourceDir;
+      this.savePersistedConfig();
     }
 
     if (!fs.existsSync(sourceDir)) {
@@ -1871,6 +1984,7 @@ export class CoreBackendService extends EventEmitter {
     this.config.minecraftDir = minecraftDir;
     this.config.clientBuildName = buildName;
     this.config.modsSourceDir = modsSourceDir;
+    this.savePersistedConfig();
 
     this.isClientSetupRunning = true;
     this.clientSteps = createInitialSteps();
@@ -1892,79 +2006,216 @@ export class CoreBackendService extends EventEmitter {
       fs.mkdirSync(minecraftDir, { recursive: true });
       this.emitClientStep('detect', 'completed', `Каталог клиента подтвержден: ${minecraftDir}`);
 
-      // Step 2: Install NeoForge 21.1.267 for Minecraft 1.21.1
+      // Step 2: Install NeoForge 1.21.1 (21.1.267) via official installer in native mode
       this.emitClientStep(
         'neoforge',
         'running',
-        `Создание структуры профиля Minecraft ${NEOFORGE_MC_VERSION} / NeoForge ${NEOFORGE_LOADER_VERSION}...`
+        `Подготовка установщика Minecraft ${NEOFORGE_MC_VERSION} / NeoForge ${NEOFORGE_LOADER_VERSION}...`
       );
-      await sleep(420);
 
       fs.mkdirSync(versionDir, { recursive: true });
+      let installedOfficialDir: string | null = null;
+      let installedLoaderVer = NEOFORGE_LOADER_VERSION;
 
-      // If user placed official neoforge-21.1.267-installer.jar next to mods or minecraftDir in native mode, invoke it safely
-      const candidateInstaller = path.join(
-        minecraftDir,
-        `neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`
-      );
-      if (this.config.mode === 'native' && this.environment === 'electron' && fs.existsSync(candidateInstaller)) {
-        await new Promise<void>((resolve, reject) => {
-          const installerProc = spawn(
-            this.config.javaPath,
-            ['-jar', candidateInstaller, '--installClient', minecraftDir],
-            { shell: false }
+      if (this.config.mode === 'native' && this.environment === 'electron') {
+        // Ensure Java 21 is detected before invoking NeoForge installer
+        this.detectJavaInstallations(true);
+        const javaExe = this.javaDetection.selectedPath || this.config.javaPath;
+        if (!javaExe || (!this.javaDetection.selectedPath && !fs.existsSync(javaExe))) {
+          throw new Error(
+            'Java 21 не найдена в системе. Установите Eclipse Temurin JDK 21 (adoptium.net) и повторите попытку.'
           );
-          installerProc.on('error', reject);
-          installerProc.on('close', (code) => {
-            if (code === 0) {
-              installerUsed = true;
-              resolve();
-            } else {
-              reject(new Error(`Инсталлятор NeoForge завершился с кодом ${code}`));
-            }
-          });
-        });
-      }
+        }
 
-      // Write TLauncher-compatible NeoForge 1.21.1 version profile JSON
-      const versionManifest = {
-        id: buildName,
-        inheritsFrom: NEOFORGE_MC_VERSION,
-        releaseTime: new Date().toISOString(),
-        time: new Date().toISOString(),
-        type: 'release',
-        mainClass: 'cpw.mods.bootstraplauncher.BootstrapLauncher',
-        arguments: {
-          game: [
-            '--fml.neoForgeVersion',
-            NEOFORGE_LOADER_VERSION,
-            '--fml.fmlVersion',
-            '4.0.34',
-            '--fml.mcVersion',
-            NEOFORGE_MC_VERSION,
-            '--fml.neoFormVersion',
-            '20240808.144430',
-            '--launchTarget',
-            'forgeclient',
-          ],
-        },
-        libraries: [
-          {
-            name: `net.neoforged:neoforge:${NEOFORGE_LOADER_VERSION}`,
-            downloads: {
-              artifact: {
-                url: `https://maven.neoforged.net/releases/net/neoforged/neoforge/${NEOFORGE_LOADER_VERSION}/neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`,
+        // Locate existing or cached installer, or download automatically from maven.neoforged.net
+        const localInstaller = path.join(
+          minecraftDir,
+          `neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`
+        );
+        let installerJar: string;
+        if (fs.existsSync(localInstaller) && fs.statSync(localInstaller).size > 100_000) {
+          installerJar = localInstaller;
+        } else {
+          this.emitClientStep(
+            'neoforge',
+            'running',
+            'Загрузка официального установщика NeoForge 1.21.1 с maven.neoforged.net...'
+          );
+          installerJar = await this.downloadNeoForgeInstaller();
+        }
+
+        const verMatch = path.basename(installerJar).match(/neoforge-(21\.1\.\d+)-installer\.jar/i);
+        if (verMatch?.[1]) {
+          installedLoaderVer = verMatch[1];
+        }
+
+        // Official NeoForge --installClient requires launcher_profiles.json inside .minecraft
+        // (TLauncher only maintains TLauncherProfiles.json by default)
+        const vanillaProfilesPath = path.join(minecraftDir, 'launcher_profiles.json');
+        if (!fs.existsSync(vanillaProfilesPath)) {
+          fs.writeFileSync(
+            vanillaProfilesPath,
+            JSON.stringify(
+              {
+                profiles: {},
+                selectedProfile: '',
+                clientToken: 'neocraft-control',
               },
-            },
-          },
-        ],
-        tlauncher: {
-          managedBy: 'NeoCraft Control',
-          isolatedDirectory: true,
-        },
-      };
+              null,
+              2
+            ),
+            'utf8'
+          );
+        }
 
-      fs.writeFileSync(versionJsonPath, JSON.stringify(versionManifest, null, 2), 'utf8');
+        const runClientInstaller = (flag: '--installClient' | '--install-client') =>
+          new Promise<{ code: number; output: string }>((resolve, reject) => {
+            let output = '';
+            const installerProc = spawn(
+              javaExe,
+              ['-Djava.awt.headless=true', '-jar', installerJar, flag, minecraftDir],
+              { cwd: minecraftDir, shell: false }
+            );
+
+            const handleLine = (chunk: Buffer) => {
+              const text = chunk.toString('utf8');
+              output += text;
+              const lines = text
+                .split(/\r?\n/)
+                .map((l) => l.trim())
+                .filter(Boolean);
+              const lastLine = lines[lines.length - 1];
+              if (lastLine) {
+                this.appendLog('INFO', 'stdout', `[NeoForge Client] ${lastLine}`);
+                if (/Downloading|Patching|Building|Extracting|Successfully/i.test(lastLine)) {
+                  this.emitClientStep('neoforge', 'running', lastLine.slice(0, 120));
+                }
+              }
+            };
+
+            installerProc.stdout.on('data', handleLine);
+            installerProc.stderr.on('data', handleLine);
+            installerProc.on('error', reject);
+            installerProc.on('close', (code) => resolve({ code: code ?? 1, output }));
+          });
+
+        this.emitClientStep(
+          'neoforge',
+          'running',
+          `Установка библиотек NeoForge ${installedLoaderVer} (--installClient)... Это займёт 1–2 минуты.`
+        );
+        this.appendLog(
+          'SYSTEM',
+          'system',
+          `Запуск установки клиента NeoForge: "${javaExe}" -Djava.awt.headless=true -jar "${installerJar}" --installClient "${minecraftDir}"`
+        );
+
+        let installOutcome = await runClientInstaller('--installClient');
+        if (
+          installOutcome.code !== 0 &&
+          /unrecognized|not a recognized option|unknown option/i.test(installOutcome.output)
+        ) {
+          installOutcome = await runClientInstaller('--install-client');
+        }
+
+        if (installOutcome.code !== 0) {
+          const tail = installOutcome.output
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .slice(-3)
+            .join(' | ');
+          throw new Error(
+            `Официальный инсталлятор NeoForge завершился с кодом ${installOutcome.code}${tail ? `: ${tail}` : ''}`
+          );
+        }
+
+        installerUsed = true;
+
+        // Locate the REAL version JSON generated by NeoForge installer (with all BootstrapLauncher & FML libraries!)
+        const versionsRoot = path.join(minecraftDir, 'versions');
+        const expectedOfficialName = `neoforge-${installedLoaderVer}`;
+        let officialJsonPath = path.join(
+          versionsRoot,
+          expectedOfficialName,
+          `${expectedOfficialName}.json`
+        );
+
+        if (!fs.existsSync(officialJsonPath) && fs.existsSync(versionsRoot)) {
+          const candidates = fs
+            .readdirSync(versionsRoot, { withFileTypes: true })
+            .filter((e) => e.isDirectory() && /^neoforge-21\.1\./i.test(e.name))
+            .map((e) => e.name)
+            .sort()
+            .reverse();
+          for (const dirName of candidates) {
+            const p = path.join(versionsRoot, dirName, `${dirName}.json`);
+            if (fs.existsSync(p)) {
+              officialJsonPath = p;
+              break;
+            }
+          }
+        }
+
+        if (!fs.existsSync(officialJsonPath)) {
+          throw new Error(
+            `Инсталлятор NeoForge завершился, но не создал профиль versions/${expectedOfficialName}/${expectedOfficialName}.json.`
+          );
+        }
+
+        installedOfficialDir = path.dirname(officialJsonPath);
+        const realManifest = JSON.parse(fs.readFileSync(officialJsonPath, 'utf8')) as Record<
+          string,
+          unknown
+        >;
+
+        // Clone the REAL complete NeoForge manifest under the user's chosen buildName
+        // preserving ALL libraries, mainClass, inheritsFrom, and JVM/game arguments intact!
+        const customManifest = {
+          ...realManifest,
+          id: buildName,
+          tlauncher: {
+            managedBy: 'NeoCraft Control',
+            isolatedDirectory: true,
+          },
+        };
+
+        fs.writeFileSync(versionJsonPath, JSON.stringify(customManifest, null, 2), 'utf8');
+
+        // If the official version folder also contains a version JAR, copy it alongside custom JSON
+        const officialJarPath = officialJsonPath.replace(/\.json$/i, '.jar');
+        const customJarPath = path.join(versionDir, `${buildName}.jar`);
+        if (fs.existsSync(officialJarPath) && officialJarPath !== customJarPath) {
+          fs.copyFileSync(officialJarPath, customJarPath);
+        }
+      } else {
+        // Sandbox / Web-preview mode: create lightweight preview manifest
+        await sleep(420);
+        const sandboxManifest = {
+          id: buildName,
+          inheritsFrom: NEOFORGE_MC_VERSION,
+          releaseTime: new Date().toISOString(),
+          time: new Date().toISOString(),
+          type: 'release',
+          mainClass: 'cpw.mods.bootstraplauncher.BootstrapLauncher',
+          arguments: {
+            game: [
+              '--fml.neoForgeVersion',
+              NEOFORGE_LOADER_VERSION,
+              '--fml.mcVersion',
+              NEOFORGE_MC_VERSION,
+              '--launchTarget',
+              'forgeclient',
+            ],
+          },
+          libraries: [],
+          tlauncher: {
+            managedBy: 'NeoCraft Control',
+            isolatedDirectory: true,
+          },
+        };
+        fs.writeFileSync(versionJsonPath, JSON.stringify(sandboxManifest, null, 2), 'utf8');
+      }
 
       // Register profile inside TLauncherProfiles.json if present (or create it)
       const tlProfilesPath = path.join(minecraftDir, 'TLauncherProfiles.json');
@@ -1994,8 +2245,8 @@ export class CoreBackendService extends EventEmitter {
         'neoforge',
         'completed',
         installerUsed
-          ? `Установлено через neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`
-          : `Профиль ${buildName}.json зарегистрирован в TLauncher`
+          ? `Установлены все библиотеки NeoForge ${installedLoaderVer} и профиль ${buildName}`
+          : `Профиль ${buildName}.json создан (режим песочницы)`
       );
 
       // Step 3: Force-create BOTH .minecraft/mods AND .minecraft/versions/<BuildName>/mods BEFORE first launch
@@ -2004,18 +2255,25 @@ export class CoreBackendService extends EventEmitter {
         'running',
         'Принудительное создание корневой и изолированной папок mods...'
       );
-      await sleep(360);
+      await sleep(300);
       fs.mkdirSync(rootModsDir, { recursive: true });
       fs.mkdirSync(isolatedModsDir, { recursive: true });
+      const officialModsDir =
+        installedOfficialDir && installedOfficialDir !== versionDir
+          ? path.join(installedOfficialDir, 'mods')
+          : null;
+      if (officialModsDir) {
+        fs.mkdirSync(officialModsDir, { recursive: true });
+      }
       this.emitClientStep(
         'init-mods',
         'completed',
-        `Созданы обе директории: ${rootModsDir} и ${isolatedModsDir}`
+        `Созданы директории: ${rootModsDir} и ${isolatedModsDir}`
       );
 
       // Step 4: Copy all .jar mods from sourceDir into BOTH client mods directories
       this.emitClientStep('copy-mods', 'running', `Копирование .jar файлов из ${modsSourceDir}...`);
-      await sleep(420);
+      await sleep(320);
 
       const copiedMods: string[] = [];
       if (fs.existsSync(modsSourceDir)) {
@@ -2024,6 +2282,9 @@ export class CoreBackendService extends EventEmitter {
           const src = path.join(modsSourceDir, entry.name);
           fs.copyFileSync(src, path.join(rootModsDir, entry.name));
           fs.copyFileSync(src, path.join(isolatedModsDir, entry.name));
+          if (officialModsDir) {
+            fs.copyFileSync(src, path.join(officialModsDir, entry.name));
+          }
           copiedMods.push(entry.name);
         }
       }

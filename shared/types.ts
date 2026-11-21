@@ -28,6 +28,8 @@ export interface ServerConfig {
 
 export interface NetworkSettings {
   serverIp: string;
+  shareIp?: string;
+  bindIp?: string;
   serverPort: number;
   propertiesPath: string;
   fileExists: boolean;

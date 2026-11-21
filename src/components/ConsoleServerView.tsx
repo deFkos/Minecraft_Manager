@@ -572,7 +572,10 @@ export function ConsoleServerView({
               <button
                 type="button"
                 onClick={() =>
-                  onPickDirectory('Выбрать директорию сервера', serverDir, (p) => setServerDir(p))
+                  onPickDirectory('Выбрать директорию сервера', serverDir, (p) => {
+                    setServerDir(p);
+                    void onUpdateConfig({ serverDir: p });
+                  })
                 }
                 aria-label="Выбрать директорию сервера"
                 className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-colors shrink-0"
@@ -640,7 +643,10 @@ export function ConsoleServerView({
                 <button
                   type="button"
                   onClick={() =>
-                    onPickFile('Выбрать JAR-файл сервера', jarFile, '.jar', (p) => setJarFile(p))
+                    onPickFile('Выбрать JAR-файл сервера', jarFile, '.jar', (p) => {
+                      setJarFile(p);
+                      void onUpdateConfig({ jarFile: p });
+                    })
                   }
                   aria-label="Выбрать JAR-файл сервера вручную"
                   title="Выбрать другой JAR вручную"

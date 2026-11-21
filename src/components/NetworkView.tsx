@@ -14,15 +14,16 @@ const HOSTNAME_REGEX =
   /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 
 export function NetworkView({ network, onSaveNetwork, onToast }: NetworkViewProps) {
-  const [serverIp, setServerIp] = useState(network.serverIp);
+  const initialIp = network.shareIp ?? network.serverIp;
+  const [serverIp, setServerIp] = useState(initialIp);
   const [portText, setPortText] = useState(String(network.serverPort));
   const [saving, setSaving] = useState(false);
   const [copiedJustNow, setCopiedJustNow] = useState(false);
 
   useEffect(() => {
-    setServerIp(network.serverIp);
+    setServerIp(network.shareIp ?? network.serverIp);
     setPortText(String(network.serverPort));
-  }, [network.serverIp, network.serverPort]);
+  }, [network.shareIp, network.serverIp, network.serverPort]);
 
   const ipError = useMemo(() => {
     const trimmed = serverIp.trim();
@@ -66,8 +67,10 @@ export function NetworkView({ network, onSaveNetwork, onToast }: NetworkViewProp
       await onSaveNetwork(trimmedIp, parsedPort);
       onToast(
         'success',
-        'server.properties обновлен',
-        `Сохранены значения server-ip=${trimmedIp || '(все)'} и server-port=${parsedPort}`
+        'Настройки сети сохранены',
+        isNonLocalExternalIp
+          ? `Адрес для друзей ${displayAddress} запомнен; в server.properties записан бинд 0.0.0.0:${parsedPort}`
+          : `Сохранены значения server-ip=${trimmedIp || '(все)'} и server-port=${parsedPort}`
       );
     } finally {
       setSaving(false);
@@ -108,7 +111,7 @@ export function NetworkView({ network, onSaveNetwork, onToast }: NetworkViewProp
             <div>
               <h2 className="text-base font-semibold text-slate-100">Настройка сети сервера</h2>
               <p className="text-xs text-slate-400 mt-1">
-                Изменения автоматически записываются в <span className="font-mono text-slate-300">server.properties</span> без потери остальных параметров
+                Изменения сохраняются постоянно и автоматически применяются в <span className="font-mono text-slate-300">server.properties</span>
               </p>
             </div>
             <Globe className="w-5 h-5 text-indigo-400 shrink-0" />
@@ -137,7 +140,7 @@ export function NetworkView({ network, onSaveNetwork, onToast }: NetworkViewProp
                 <p className="text-xs text-red-400">{ipError}</p>
               ) : isNonLocalExternalIp ? (
                 <p className="text-xs text-amber-300 leading-relaxed">
-                  Внимание: IP <span className="font-mono">{trimmedIp}</span> не найден на сетевых адаптерах ПК (это внешний IP роутера). При старте сервер автоматически переключит <span className="font-mono">server-ip</span> на <span className="font-mono">0.0.0.0</span>, чтобы избежать ошибки <span className="font-mono">BindException</span> — друзья смогут подключаться по <span className="font-mono">{displayAddress}</span>.
+                  Внешний IP <span className="font-mono">{trimmedIp}</span> сохраняется для друзей (<span className="font-mono">{displayAddress}</span>), а в <span className="font-mono">server.properties</span> автоматически пишется <span className="font-mono">server-ip=</span> (<span className="font-mono">0.0.0.0</span>), чтобы сервер запускался без <span className="font-mono">BindException</span>.
                 </p>
               ) : (
                 <p className="text-xs text-slate-500">
