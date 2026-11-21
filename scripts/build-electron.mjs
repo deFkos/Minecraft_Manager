@@ -89,7 +89,7 @@ async function main() {
     builderArgs.push('--win', 'nsis', '--linux', 'AppImage');
   }
 
-  runStep(npxCmd, builderArgs);
+  runStep(npxCmd, builderArgs, { CSC_IDENTITY_AUTO_DISCOVERY: 'false' });
 
   const releaseDir = path.join(rootDir, 'release');
   console.log(`\n✓ Готово! Установщик собран в папке: ${releaseDir}`);

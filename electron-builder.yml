@@ -17,6 +17,7 @@ win:
       arch:
         - x64
   icon: build/icon.png
+  signAndEditExecutable: false
   artifactName: NeoCraft-Control-Setup-${version}.${ext}
 nsis:
   oneClick: false
