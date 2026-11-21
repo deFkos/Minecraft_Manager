@@ -1785,6 +1785,92 @@ export class CoreBackendService extends EventEmitter {
     return this.startServer();
   }
 
+  private createMinecraftOfflineUuid(exactName: string): string {
+    const hash = crypto.createHash('md5').update(`OfflinePlayer:${exactName}`, 'utf8').digest();
+    hash[6] = (hash[6] & 0x0f) | 0x30; // UUID v3
+    hash[8] = (hash[8] & 0x3f) | 0x80; // RFC 4122 variant
+    const hex = hash.toString('hex');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  }
+
+  private isOfflineModeServer(serverDir: string): boolean {
+    try {
+      const propsPath = path.join(serverDir, 'server.properties');
+      if (!fs.existsSync(propsPath)) return true;
+      const content = fs.readFileSync(propsPath, 'utf8');
+      return /^online-mode\s*=\s*false$/im.test(content);
+    } catch {
+      return true;
+    }
+  }
+
+  private upsertUserCacheEntry(serverDir: string, exactName: string, uuid: string): void {
+    try {
+      const cachePath = path.join(serverDir, 'usercache.json');
+      let entries: Array<{ name?: string; uuid?: string; expiresOn?: string }> = [];
+      if (fs.existsSync(cachePath)) {
+        const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+        if (Array.isArray(parsed)) entries = parsed;
+      }
+      const lower = exactName.toLowerCase();
+      const filtered = entries.filter(
+        (item) => typeof item?.name === 'string' && item.name.toLowerCase() !== lower
+      );
+      const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      const expiresOn = `${expires.toISOString().slice(0, 19).replace('T', ' ')} +0000`;
+      filtered.unshift({ name: exactName, uuid, expiresOn });
+      fs.writeFileSync(cachePath, JSON.stringify(filtered, null, 2), 'utf8');
+    } catch {
+      // non-fatal
+    }
+  }
+
+  private syncOfflinePlayerFile(
+    serverDir: string,
+    fileName: 'whitelist.json' | 'ops.json',
+    action: 'add' | 'remove',
+    exactName: string
+  ): void {
+    const filePath = path.join(serverDir, fileName);
+    let entries: Array<Record<string, unknown>> = [];
+    if (fs.existsSync(filePath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        if (Array.isArray(parsed)) entries = parsed;
+      } catch {
+        entries = [];
+      }
+    }
+
+    const lower = exactName.toLowerCase();
+    const filtered = entries.filter(
+      (item) => typeof item?.name !== 'string' || item.name.toLowerCase() !== lower
+    );
+
+    if (action === 'add') {
+      const uuid = this.createMinecraftOfflineUuid(exactName);
+      if (fileName === 'ops.json') {
+        filtered.push({
+          uuid,
+          name: exactName,
+          level: 4,
+          bypassesPlayerLimit: false,
+        });
+      } else {
+        filtered.push({
+          uuid,
+          name: exactName,
+        });
+      }
+      this.upsertUserCacheEntry(serverDir, exactName, uuid);
+    }
+
+    fs.writeFileSync(filePath, JSON.stringify(filtered, null, 2), 'utf8');
+    const players = this.readPlayersFromDisk(serverDir);
+    this.runtime.players = players;
+    this.emit('players-update', players);
+  }
+
   public sendCommand(rawCommand: string): { ok: boolean; error?: string } {
     if (!this.childProc || this.runtime.status === 'offline') {
       return { ok: false, error: 'Сервер не запущен. Запустите сервер перед отправкой команд.' };
@@ -1799,7 +1885,72 @@ export class CoreBackendService extends EventEmitter {
     }
 
     this.appendLog('CMD', 'stdin', `> ${command}`);
+
     try {
+      const safeServerDir = this.resolveSafePath(this.config.serverDir);
+      const offlineMode = this.isOfflineModeServer(safeServerDir);
+
+      // In offline-mode (online-mode=false, TLauncher), Minecraft 1.21.1 lowercases unknown nicknames
+      // via GameProfileCache and generates the WRONG lowercase OfflinePlayer UUID, blocking caps nicknames.
+      // Handle whitelist & op commands with exact-case OfflinePlayer UUID v3 and reload cleanly!
+      const wlAddMatch = command.match(/^whitelist\s+add\s+([A-Za-z0-9_]{3,16})$/i);
+      const wlRemoveMatch = command.match(/^whitelist\s+remove\s+([A-Za-z0-9_]{3,16})$/i);
+      const opMatch = command.match(/^op\s+([A-Za-z0-9_]{3,16})$/i);
+      const deopMatch = command.match(/^deop\s+([A-Za-z0-9_]{3,16})$/i);
+
+      if (offlineMode && wlAddMatch) {
+        const exactName = wlAddMatch[1];
+        this.syncOfflinePlayerFile(safeServerDir, 'whitelist.json', 'add', exactName);
+        this.childProc.stdin.write('whitelist reload\n');
+        this.appendLog(
+          'SYSTEM',
+          'system',
+          `Игрок ${exactName} добавлен в whitelist.json с сохранением регистра (Offline UUID) и список перезагружен.`
+        );
+        return { ok: true };
+      }
+
+      if (offlineMode && wlRemoveMatch) {
+        const exactName = wlRemoveMatch[1];
+        this.syncOfflinePlayerFile(safeServerDir, 'whitelist.json', 'remove', exactName);
+        this.childProc.stdin.write('whitelist reload\n');
+        this.appendLog(
+          'SYSTEM',
+          'system',
+          `Игрок ${exactName} удалён из whitelist.json и список перезагружен.`
+        );
+        return { ok: true };
+      }
+
+      if (offlineMode && opMatch) {
+        const exactName = opMatch[1];
+        // Pre-seed exact-case usercache + ops.json, run live op command for online player,
+        // and verify exact-case entry after Minecraft flushes ops.json
+        this.syncOfflinePlayerFile(safeServerDir, 'ops.json', 'add', exactName);
+        this.childProc.stdin.write(`op ${exactName}\n`);
+        setTimeout(() => {
+          try {
+            this.syncOfflinePlayerFile(safeServerDir, 'ops.json', 'add', exactName);
+          } catch {
+            // ignore
+          }
+        }, 450);
+        return { ok: true };
+      }
+
+      if (offlineMode && deopMatch) {
+        const exactName = deopMatch[1];
+        this.childProc.stdin.write(`deop ${exactName}\n`);
+        setTimeout(() => {
+          try {
+            this.syncOfflinePlayerFile(safeServerDir, 'ops.json', 'remove', exactName);
+          } catch {
+            // ignore
+          }
+        }, 450);
+        return { ok: true };
+      }
+
       this.childProc.stdin.write(`${command}\n`);
       return { ok: true };
     } catch (error) {
@@ -2169,25 +2320,93 @@ export class CoreBackendService extends EventEmitter {
           unknown
         >;
 
-        // Clone the REAL complete NeoForge manifest under the user's chosen buildName
-        // preserving ALL libraries, mainClass, inheritsFrom, and JVM/game arguments intact!
-        const customManifest = {
-          ...realManifest,
-          id: buildName,
-          tlauncher: {
-            managedBy: 'NeoCraft Control',
-            isolatedDirectory: true,
-          },
-        };
+        // Verify ALL NeoForge libraries (especially bootstraplauncher & securejarhandler) exist on disk
+        this.emitClientStep(
+          'neoforge',
+          'running',
+          'Проверка и докачка библиотек NeoForge (BootstrapLauncher, SecureJarHandler, ASM)...'
+        );
+        const nfLibraries = Array.isArray(realManifest.libraries) ? realManifest.libraries : [];
+        const libCheck = await this.ensureManifestLibrariesOnDisk(minecraftDir, nfLibraries);
+        this.appendLog(
+          'SYSTEM',
+          'system',
+          `Библиотеки NeoForge проверены: ${libCheck.verified} на диске, ${libCheck.downloaded} докачано. BootstrapLauncher: ${libCheck.bootstrapPath}`
+        );
 
+        // Fetch vanilla 1.21.1 manifest (local cache or Mojang piston-meta) so we can produce
+        // a 100% standalone JSON without inheritsFrom (fixes TLauncher Linux/Windows inheritsFrom & classpath bugs!)
+        this.emitClientStep(
+          'neoforge',
+          'running',
+          `Сборка автономного профиля TLauncher (MC ${NEOFORGE_MC_VERSION} + NeoForge ${installedLoaderVer})...`
+        );
+        const vanillaManifest = await this.fetchVanillaVersionManifest(
+          minecraftDir,
+          NEOFORGE_MC_VERSION
+        );
+
+        const officialId =
+          typeof realManifest.id === 'string' && realManifest.id.trim()
+            ? realManifest.id.trim()
+            : path.basename(officialJsonPath, '.json');
+
+        // Build TLauncher-ready manifest with expanded ${library_directory}, ${classpath_separator}, ${version_name}
+        // and merged vanilla 1.21.1 libraries/arguments/javaVersion
+        const customManifest = this.buildTLauncherReadyNeoForgeManifest(
+          realManifest,
+          vanillaManifest,
+          minecraftDir,
+          buildName
+        );
         fs.writeFileSync(versionJsonPath, JSON.stringify(customManifest, null, 2), 'utf8');
 
-        // If the official version folder also contains a version JAR, copy it alongside custom JSON
-        const officialJarPath = officialJsonPath.replace(/\.json$/i, '.jar');
-        const customJarPath = path.join(versionDir, `${buildName}.jar`);
-        if (fs.existsSync(officialJarPath) && officialJarPath !== customJarPath) {
-          fs.copyFileSync(officialJarPath, customJarPath);
+        // Also patch the official neoforge-21.1.x.json so launching either profile in TLauncher works cleanly
+        if (path.resolve(officialJsonPath) !== path.resolve(versionJsonPath)) {
+          const patchedOfficialManifest = this.buildTLauncherReadyNeoForgeManifest(
+            realManifest,
+            vanillaManifest,
+            minecraftDir,
+            officialId
+          );
+          fs.writeFileSync(
+            officialJsonPath,
+            JSON.stringify(patchedOfficialManifest, null, 2),
+            'utf8'
+          );
         }
+
+        // Sync client version JAR if vanilla 1.21.1.jar (or official JAR) is already present locally
+        const officialJarPath = officialJsonPath.replace(/\.json$/i, '.jar');
+        const vanillaJarPath = path.join(
+          versionsRoot,
+          NEOFORGE_MC_VERSION,
+          `${NEOFORGE_MC_VERSION}.jar`
+        );
+        const customJarPath = path.join(versionDir, `${buildName}.jar`);
+        const sourceJarCandidate =
+          fs.existsSync(officialJarPath) && fs.statSync(officialJarPath).size > 1_000_000
+            ? officialJarPath
+            : fs.existsSync(vanillaJarPath) && fs.statSync(vanillaJarPath).size > 1_000_000
+              ? vanillaJarPath
+              : null;
+
+        if (sourceJarCandidate && path.resolve(sourceJarCandidate) !== path.resolve(customJarPath)) {
+          fs.copyFileSync(sourceJarCandidate, customJarPath);
+        } else if (fs.existsSync(customJarPath) && fs.statSync(customJarPath).size < 100_000) {
+          // Remove any broken/empty stub JAR so TLauncher downloads the real 1.21.1 client JAR via downloads.client
+          try {
+            fs.unlinkSync(customJarPath);
+          } catch {
+            // ignore
+          }
+        }
+
+        this.appendLog(
+          'SYSTEM',
+          'system',
+          `Патч TLauncher применён (${vanillaManifest ? 'автономный профиль без inheritsFrom' : 'inheritsFrom + патч JVM'}): library_directory="${path.join(minecraftDir, 'libraries')}", разделитель="${path.delimiter}", javaVersion=21.`
+        );
       } else {
         // Sandbox / Web-preview mode: create lightweight preview manifest
         await sleep(420);
@@ -2346,6 +2565,348 @@ export class CoreBackendService extends EventEmitter {
     } finally {
       this.isClientSetupRunning = false;
     }
+  }
+
+  private async fetchVanillaVersionManifest(
+    minecraftDir: string,
+    mcVersion: string
+  ): Promise<Record<string, unknown> | null> {
+    const localVanillaDir = path.join(minecraftDir, 'versions', mcVersion);
+    const localVanillaJson = path.join(localVanillaDir, `${mcVersion}.json`);
+
+    if (fs.existsSync(localVanillaJson)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(localVanillaJson, 'utf8')) as Record<
+          string,
+          unknown
+        >;
+        if (
+          Array.isArray(parsed.libraries) &&
+          parsed.libraries.length > 0 &&
+          typeof parsed.arguments === 'object' &&
+          parsed.arguments !== null
+        ) {
+          return parsed;
+        }
+      } catch {
+        // Ignore corrupted local cache and refetch below
+      }
+    }
+
+    try {
+      const metaRes = await fetch('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json', {
+        redirect: 'follow',
+      });
+      if (!metaRes.ok) {
+        throw new Error(`HTTP ${metaRes.status}`);
+      }
+      const meta = (await metaRes.json()) as {
+        versions?: Array<{ id?: string; url?: string }>;
+      };
+      const entry = meta.versions?.find((v) => v.id === mcVersion && typeof v.url === 'string');
+      if (!entry?.url || !entry.url.startsWith('https://')) {
+        throw new Error(`Версия ${mcVersion} не найдена в version_manifest_v2.json`);
+      }
+
+      const verRes = await fetch(entry.url, { redirect: 'follow' });
+      if (!verRes.ok) {
+        throw new Error(`HTTP ${verRes.status}`);
+      }
+      const vanillaJson = (await verRes.json()) as Record<string, unknown>;
+      fs.mkdirSync(localVanillaDir, { recursive: true });
+      fs.writeFileSync(localVanillaJson, JSON.stringify(vanillaJson, null, 2), 'utf8');
+      return vanillaJson;
+    } catch (err) {
+      this.appendLog(
+        'WARN',
+        'system',
+        `Не удалось получить манифест Minecraft ${mcVersion} с piston-meta.mojang.com (${err instanceof Error ? err.message : 'ошибка сети'}). Будет использован режим inheritsFrom с патчем JVM.`
+      );
+      return null;
+    }
+  }
+
+  private async ensureManifestLibrariesOnDisk(
+    minecraftDir: string,
+    libraries: unknown[]
+  ): Promise<{ verified: number; downloaded: number; bootstrapPath: string }> {
+    const librariesRoot = path.resolve(path.join(minecraftDir, 'libraries'));
+    fs.mkdirSync(librariesRoot, { recursive: true });
+
+    let verified = 0;
+    let downloaded = 0;
+    let bootstrapPath: string | null = null;
+
+    for (const item of libraries) {
+      if (typeof item !== 'object' || item === null) continue;
+      const lib = item as {
+        name?: string;
+        downloads?: {
+          artifact?: {
+            path?: string;
+            url?: string;
+            size?: number;
+          };
+        };
+      };
+      const artifact = lib.downloads?.artifact;
+      if (!artifact?.path || typeof artifact.path !== 'string') continue;
+
+      const relPath = artifact.path.replace(/^[/\\]+/, '');
+      const destPath = path.resolve(librariesRoot, relPath);
+      if (destPath !== librariesRoot && !destPath.startsWith(librariesRoot + path.sep)) {
+        continue;
+      }
+
+      const isBootstrap =
+        relPath.toLowerCase().includes('bootstraplauncher') &&
+        relPath.toLowerCase().endsWith('.jar');
+
+      let existsOk = false;
+      if (fs.existsSync(destPath)) {
+        try {
+          const stat = fs.statSync(destPath);
+          existsOk = stat.isFile() && stat.size > 0 && (!artifact.size || stat.size === artifact.size);
+        } catch {
+          existsOk = false;
+        }
+      }
+
+      if (existsOk) {
+        verified++;
+        if (isBootstrap) bootstrapPath = destPath;
+        continue;
+      }
+
+      if (artifact.url && typeof artifact.url === 'string' && artifact.url.startsWith('https://')) {
+        try {
+          const res = await fetch(artifact.url, { redirect: 'follow' });
+          if (res.ok) {
+            const buf = Buffer.from(await res.arrayBuffer());
+            if (buf.length > 0) {
+              fs.mkdirSync(path.dirname(destPath), { recursive: true });
+              fs.writeFileSync(destPath, buf);
+              downloaded++;
+              if (isBootstrap) bootstrapPath = destPath;
+            }
+          }
+        } catch {
+          // Will be caught below if critical bootstraplauncher is still missing
+        }
+      }
+    }
+
+    // Fallback scan for bootstraplauncher-*.jar on disk
+    if (!bootstrapPath) {
+      const bsRoot = path.join(librariesRoot, 'cpw', 'mods', 'bootstraplauncher');
+      if (fs.existsSync(bsRoot)) {
+        const stack = [bsRoot];
+        while (stack.length > 0 && !bootstrapPath) {
+          const dir = stack.pop()!;
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+              stack.push(full);
+            } else if (
+              entry.isFile() &&
+              /^bootstraplauncher-.*\.jar$/i.test(entry.name) &&
+              fs.statSync(full).size > 0
+            ) {
+              bootstrapPath = full;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!bootstrapPath || !fs.existsSync(bootstrapPath)) {
+      throw new Error(
+        'Критическая библиотека cpw/mods/bootstraplauncher не найдена на диске после установки NeoForge. Проверьте доступ к maven.neoforged.net и повторите попытку.'
+      );
+    }
+
+    return { verified, downloaded, bootstrapPath };
+  }
+
+  private resolveArgPlaceholders(
+    args: unknown[],
+    replacements: Record<string, string>,
+    targetVersionName: string
+  ): unknown[] {
+    const replaceStr = (raw: string): string => {
+      let out = raw;
+      for (const [token, value] of Object.entries(replacements)) {
+        if (out.includes(token)) {
+          out = out.split(token).join(value);
+        }
+      }
+      if (out.startsWith('-DignoreList=')) {
+        const prefix = '-DignoreList=';
+        const existing = out
+          .slice(prefix.length)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const required = ['client-extra', `${targetVersionName}.jar`, `${NEOFORGE_MC_VERSION}.jar`];
+        for (const item of required) {
+          if (!existing.includes(item)) {
+            existing.push(item);
+          }
+        }
+        out = `${prefix}${existing.join(',')}`;
+      }
+      return out;
+    };
+
+    return args.map((entry) => {
+      if (typeof entry === 'string') {
+        return replaceStr(entry);
+      }
+      if (typeof entry === 'object' && entry !== null) {
+        const obj = entry as Record<string, unknown>;
+        if (typeof obj.value === 'string') {
+          return { ...obj, value: replaceStr(obj.value) };
+        }
+        if (Array.isArray(obj.value)) {
+          return {
+            ...obj,
+            value: obj.value.map((v) => (typeof v === 'string' ? replaceStr(v) : v)),
+          };
+        }
+      }
+      return entry;
+    });
+  }
+
+  private buildTLauncherReadyNeoForgeManifest(
+    neoforgeManifest: Record<string, unknown>,
+    vanillaManifest: Record<string, unknown> | null,
+    minecraftDir: string,
+    targetId: string
+  ): Record<string, unknown> {
+    const librariesDir = path.join(minecraftDir, 'libraries');
+    const replacements: Record<string, string> = {
+      '${library_directory}': librariesDir,
+      '${classpath_separator}': path.delimiter,
+      '${version_name}': targetId,
+    };
+
+    const nfArguments =
+      typeof neoforgeManifest.arguments === 'object' && neoforgeManifest.arguments !== null
+        ? (neoforgeManifest.arguments as { game?: unknown[]; jvm?: unknown[] })
+        : {};
+    const nfGameArgs = Array.isArray(nfArguments.game)
+      ? this.resolveArgPlaceholders(nfArguments.game, replacements, targetId)
+      : [];
+    const nfJvmArgs = Array.isArray(nfArguments.jvm)
+      ? this.resolveArgPlaceholders(nfArguments.jvm, replacements, targetId)
+      : [];
+    const nfLibraries = Array.isArray(neoforgeManifest.libraries) ? neoforgeManifest.libraries : [];
+
+    const defaultJavaVersion = {
+      component: 'java-runtime-delta',
+      majorVersion: 21,
+    };
+
+    if (!vanillaManifest) {
+      return {
+        ...neoforgeManifest,
+        id: targetId,
+        javaVersion: neoforgeManifest.javaVersion ?? defaultJavaVersion,
+        arguments: {
+          ...nfArguments,
+          game: nfGameArgs,
+          jvm: nfJvmArgs,
+        },
+        libraries: nfLibraries,
+      };
+    }
+
+    const vanillaArguments =
+      typeof vanillaManifest.arguments === 'object' && vanillaManifest.arguments !== null
+        ? (vanillaManifest.arguments as { game?: unknown[]; jvm?: unknown[] })
+        : {};
+    const vanillaGameArgs = Array.isArray(vanillaArguments.game) ? vanillaArguments.game : [];
+    const vanillaJvmArgs = Array.isArray(vanillaArguments.jvm) ? vanillaArguments.jvm : [];
+    const vanillaLibraries = Array.isArray(vanillaManifest.libraries)
+      ? vanillaManifest.libraries
+      : [];
+
+    // Deduplicate libraries by Maven group:artifact[:classifier], prioritizing NeoForge's entries first
+    const getLibraryCoordKey = (lib: unknown): string | null => {
+      if (typeof lib !== 'object' || lib === null) return null;
+      const name = (lib as { name?: unknown }).name;
+      if (typeof name !== 'string' || !name.includes(':')) return null;
+      const parts = name.split(':');
+      if (parts.length >= 4) {
+        return `${parts[0]}:${parts[1]}:${parts[3]}`;
+      }
+      return `${parts[0]}:${parts[1]}`;
+    };
+
+    const seenKeys = new Set<string>();
+    const mergedLibraries: unknown[] = [];
+
+    for (const lib of nfLibraries) {
+      const key = getLibraryCoordKey(lib);
+      if (key) seenKeys.add(key);
+      mergedLibraries.push(lib);
+    }
+    for (const lib of vanillaLibraries) {
+      const key = getLibraryCoordKey(lib);
+      // Keep vanilla libraries with OS rules (LWJGL natives) even if coordinates overlap
+      const hasRules =
+        typeof lib === 'object' &&
+        lib !== null &&
+        Array.isArray((lib as { rules?: unknown }).rules);
+      if (!hasRules && key && seenKeys.has(key)) {
+        continue;
+      }
+      if (key && !hasRules) seenKeys.add(key);
+      mergedLibraries.push(lib);
+    }
+
+    // Place resolved NeoForge JVM flags (module path -p, -DlibraryDirectory, --add-modules, --add-opens)
+    // right before "-cp ${classpath}" so every launcher (including TLauncher on Linux) parses both cleanly
+    const vanillaJvmBeforeCp: unknown[] = [];
+    for (let i = 0; i < vanillaJvmArgs.length; i++) {
+      if (vanillaJvmArgs[i] === '-cp' && vanillaJvmArgs[i + 1] === '${classpath}') {
+        i++;
+        continue;
+      }
+      vanillaJvmBeforeCp.push(vanillaJvmArgs[i]);
+    }
+
+    const mergedJvmArgs: unknown[] = [
+      ...vanillaJvmBeforeCp,
+      ...nfJvmArgs,
+      '-cp',
+      '${classpath}',
+    ];
+
+    const mergedGameArgs: unknown[] = [...vanillaGameArgs, ...nfGameArgs];
+
+    return {
+      id: targetId,
+      type: neoforgeManifest.type ?? vanillaManifest.type ?? 'release',
+      time: neoforgeManifest.time ?? vanillaManifest.time ?? new Date().toISOString(),
+      releaseTime:
+        neoforgeManifest.releaseTime ?? vanillaManifest.releaseTime ?? new Date().toISOString(),
+      mainClass: neoforgeManifest.mainClass ?? 'cpw.mods.bootstraplauncher.BootstrapLauncher',
+      minimumLauncherVersion: vanillaManifest.minimumLauncherVersion ?? 21,
+      complianceLevel: vanillaManifest.complianceLevel ?? 1,
+      assets: vanillaManifest.assets,
+      assetIndex: vanillaManifest.assetIndex,
+      downloads: vanillaManifest.downloads,
+      logging: vanillaManifest.logging,
+      javaVersion: vanillaManifest.javaVersion ?? defaultJavaVersion,
+      arguments: {
+        game: mergedGameArgs,
+        jvm: mergedJvmArgs,
+      },
+      libraries: mergedLibraries,
+    };
   }
 
   public browseDirectory(targetPath?: string): FsBrowseResult {
