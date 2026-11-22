@@ -16,6 +16,25 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Linux / Wayland / Hyprland (Omarchy) compositor stability flags:
+// prevents Chromium Viz "components/viz/service/display/display.cc frame latency" stalls and Wayland surface crashes
+if (process.platform === 'linux') {
+  const isWayland =
+    Boolean(process.env.WAYLAND_DISPLAY) ||
+    process.env.XDG_SESSION_TYPE?.toLowerCase() === 'wayland';
+
+  if (isWayland) {
+    app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
+    app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform,WaylandWindowDecorations');
+    app.commandLine.appendSwitch('disable-features', 'WaylandPerSurfaceScale');
+  }
+  app.commandLine.appendSwitch('disable-gpu-sandbox');
+  app.commandLine.appendSwitch('disable-gpu-vsync');
+  if (process.env.NEOCRAFT_SOFTWARE_GL === '1') {
+    app.disableHardwareAcceleration();
+  }
+}
+
 let mainWindow: BrowserWindow | null = null;
 let coreService: CoreBackendService | null = null;
 

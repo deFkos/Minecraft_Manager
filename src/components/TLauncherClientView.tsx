@@ -285,6 +285,22 @@ export function TLauncherClientView({
             </dl>
           </section>
         )}
+
+        {/* Persistent Error Card */}
+        {lastSetup && !lastSetup.success && lastSetup.error && (
+          <section className="rounded-xl bg-red-950/30 border border-red-500/35 p-5 space-y-2">
+            <div className="flex items-center gap-2 text-red-400">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <h3 className="text-sm font-semibold">Не удалось создать сборку {lastSetup.buildName}</h3>
+            </div>
+            <p className="text-xs font-mono text-red-200 break-words leading-relaxed">
+              {lastSetup.error}
+            </p>
+            <p className="text-[11px] text-slate-400">
+              Подробный лог установки доступен на вкладке «Консоль и Сервер» (строки с префиксом [NeoForge Client]).
+            </p>
+          </section>
+        )}
       </div>
 
       {/* Right: 5-Step Real-Time Installation Stepper */}

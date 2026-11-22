@@ -683,8 +683,17 @@ export class CoreBackendService extends EventEmitter {
   ): Promise<void> {
     const errors: string[] = [];
 
+    const cleanupPartial = () => {
+      try {
+        if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+      } catch {
+        // ignore
+      }
+    };
+
     // 1. Node https.get forced IPv4 (fixes Linux undici fetch failed / broken IPv6 routing)
     try {
+      cleanupPartial();
       await this.downloadViaNodeHttp(url, destPath, 4, onProgress);
       if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
     } catch (err) {
@@ -693,6 +702,7 @@ export class CoreBackendService extends EventEmitter {
 
     // 2. Node https.get default IP family (IPv6 fallback)
     try {
+      cleanupPartial();
       await this.downloadViaNodeHttp(url, destPath, 0, onProgress);
       if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
     } catch (err) {
@@ -701,12 +711,14 @@ export class CoreBackendService extends EventEmitter {
 
     // 3. System curl / wget fallback (respects Linux system CA store & HTTP_PROXY/HTTPS_PROXY)
     try {
+      cleanupPartial();
       await this.downloadViaCliTool(url, destPath);
       if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
     } catch (err) {
       errors.push(`CLI: ${this.formatNetworkError(err)}`);
     }
 
+    cleanupPartial();
     throw new Error(errors.join(' | ') || 'сетевая ошибка загрузки');
   }
 
@@ -1056,17 +1068,32 @@ export class CoreBackendService extends EventEmitter {
       candidates.push({ bin: normalized, source });
     };
 
+    const visitedScanDirs = new Set<string>();
     const scanChildrenForJava = (baseDir: string, source: string, depth = 1) => {
       try {
         if (!baseDir || !fs.existsSync(baseDir)) return;
+        const realBase = fs.realpathSync(baseDir);
+        const dirKey = isWin ? realBase.toLowerCase() : realBase;
+        if (visitedScanDirs.has(dirKey)) return;
+        visitedScanDirs.add(dirKey);
+
         const directBin = path.join(baseDir, 'bin', exeName);
         if (fs.existsSync(directBin)) {
           addCandidate(directBin, source);
         }
         if (depth <= 0) return;
         for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue;
-          scanChildrenForJava(path.join(baseDir, entry.name), source, depth - 1);
+          const childPath = path.join(baseDir, entry.name);
+          let isDir = entry.isDirectory();
+          if (!isDir && entry.isSymbolicLink()) {
+            try {
+              isDir = fs.statSync(childPath).isDirectory();
+            } catch {
+              isDir = false;
+            }
+          }
+          if (!isDir) continue;
+          scanChildrenForJava(childPath, source, depth - 1);
         }
       } catch {
         // Ignore unreadable system folders
@@ -1112,19 +1139,24 @@ export class CoreBackendService extends EventEmitter {
         { dir: path.join(programFiles, 'AdoptOpenJDK'), source: 'AdoptOpenJDK', depth: 2 },
         { dir: path.join(localAppData, 'Programs', 'Eclipse Adoptium'), source: 'Eclipse Adoptium', depth: 2 },
         { dir: path.join(programFilesX86, 'Java'), source: 'Program Files (x86)\\Java', depth: 2 },
-        { dir: path.join(appData, '.tlauncher', 'jvms'), source: 'TLauncher JVM', depth: 2 },
-        { dir: path.join(appData, '.minecraft', 'runtime'), source: 'Minecraft Runtime', depth: 3 },
+        { dir: path.join(appData, '.tlauncher', 'jvms'), source: 'TLauncher JVM', depth: 3 },
+        { dir: path.join(appData, '.minecraft', 'runtime'), source: 'Minecraft Runtime', depth: 4 },
       ];
       for (const root of winRoots) {
         scanChildrenForJava(root.dir, root.source, root.depth);
       }
     } else {
+      const home = os.homedir();
       const linuxRoots: Array<{ dir: string; source: string; depth: number }> = [
         { dir: '/usr/lib/jvm', source: '/usr/lib/jvm', depth: 2 },
         { dir: '/usr/java', source: '/usr/java', depth: 2 },
         { dir: '/opt/java', source: '/opt/java', depth: 2 },
-        { dir: path.join(os.homedir(), '.sdkman', 'candidates', 'java'), source: 'SDKMAN', depth: 2 },
-        { dir: path.join(os.homedir(), '.tlauncher', 'jvms'), source: 'TLauncher JVM', depth: 2 },
+        { dir: path.join(home, '.local', 'share', 'mise', 'installs', 'java'), source: 'mise Java', depth: 3 },
+        { dir: path.join(home, '.asdf', 'installs', 'java'), source: 'asdf Java', depth: 3 },
+        { dir: path.join(home, '.sdkman', 'candidates', 'java'), source: 'SDKMAN', depth: 2 },
+        { dir: path.join(home, '.jdks'), source: 'User JDKs', depth: 2 },
+        { dir: path.join(home, '.tlauncher', 'jvms'), source: 'TLauncher JVM', depth: 3 },
+        { dir: path.join(home, '.minecraft', 'runtime'), source: 'Minecraft Runtime', depth: 4 },
       ];
       for (const root of linuxRoots) {
         scanChildrenForJava(root.dir, root.source, root.depth);
@@ -2419,7 +2451,9 @@ export class CoreBackendService extends EventEmitter {
         const javaExe = this.javaDetection.selectedPath || this.config.javaPath;
         if (!javaExe || (!this.javaDetection.selectedPath && !fs.existsSync(javaExe))) {
           throw new Error(
-            'Java 21 не найдена в системе. Установите Eclipse Temurin JDK 21 (adoptium.net) и повторите попытку.'
+            process.platform === 'linux'
+              ? 'Java 21 не найдена в системе. На Arch/Omarchy выполните: sudo pacman -S jdk21-openjdk (или mise use -g java@temurin-21) и повторите попытку.'
+              : 'Java 21 не найдена в системе. Установите Eclipse Temurin JDK 21 (adoptium.net) и повторите попытку.'
           );
         }
 
@@ -2739,15 +2773,20 @@ export class CoreBackendService extends EventEmitter {
       this.emitClientStep('copy-mods', 'running', `Копирование .jar файлов из ${modsSourceDir}...`);
       await sleep(320);
 
+      const safeCopyMod = (src: string, dst: string) => {
+        if (path.resolve(src) === path.resolve(dst)) return;
+        fs.copyFileSync(src, dst);
+      };
+
       const copiedMods: string[] = [];
       if (fs.existsSync(modsSourceDir)) {
         for (const entry of fs.readdirSync(modsSourceDir, { withFileTypes: true })) {
           if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.jar')) continue;
           const src = path.join(modsSourceDir, entry.name);
-          fs.copyFileSync(src, path.join(rootModsDir, entry.name));
-          fs.copyFileSync(src, path.join(isolatedModsDir, entry.name));
+          safeCopyMod(src, path.join(rootModsDir, entry.name));
+          safeCopyMod(src, path.join(isolatedModsDir, entry.name));
           if (officialModsDir) {
-            fs.copyFileSync(src, path.join(officialModsDir, entry.name));
+            safeCopyMod(src, path.join(officialModsDir, entry.name));
           }
           copiedMods.push(entry.name);
         }

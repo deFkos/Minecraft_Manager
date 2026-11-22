@@ -45,6 +45,10 @@ declare module 'electron' {
     exit(exitCode?: number): void;
     getAppPath(): string;
     requestSingleInstanceLock(): boolean;
+    disableHardwareAcceleration(): void;
+    commandLine: {
+      appendSwitch(flag: string, value?: string): void;
+    };
     isPackaged: boolean;
   };
 
