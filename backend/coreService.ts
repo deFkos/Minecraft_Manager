@@ -7,6 +7,7 @@ import http from 'node:http';
 import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 try {
   dns.setDefaultResultOrder('ipv4first');
@@ -43,6 +44,9 @@ const NEOFORGE_MC_VERSION = '1.21.1';
 const NEOFORGE_LOADER_VERSION = '21.1.267';
 const DEFAULT_BUILD_NAME = `NeoForge-${NEOFORGE_MC_VERSION}-${NEOFORGE_LOADER_VERSION}`;
 const NEOFORGE_MAVEN_BASE = 'https://maven.neoforged.net/releases/net/neoforged/neoforge';
+const BMCLAPI_MAVEN_BASE = 'https://bmclapi2.bangbang93.com/maven';
+const MAVEN_CENTRAL_BASE = 'https://repo1.maven.org/maven2';
+const ALIYUN_MAVEN_BASE = 'https://maven.aliyun.com/repository/public';
 
 const SAMPLE_MODS: Array<{ name: string; sizeKb: number; modId: string }> = [
   { name: 'sodium-neoforge-0.6.5+mc1.21.1.jar', sizeKb: 1184, modId: 'sodium' },
@@ -142,6 +146,7 @@ export class CoreBackendService extends EventEmitter {
   private installStage: string | null = null;
   private installPercent = 0;
   private installError: string | null = null;
+  private readonly blockedHosts = new Set<string>();
   private networkPrefs: {
     shareIp: string;
     bindIp: string;
@@ -393,21 +398,31 @@ export class CoreBackendService extends EventEmitter {
     }
   }
 
-  private findCachedInstaller(): string | null {
-    const candidates = [
-      path.join(this.installerCacheDir, `neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`),
-    ];
-    try {
-      if (fs.existsSync(this.installerCacheDir)) {
-        for (const entry of fs.readdirSync(this.installerCacheDir)) {
-          if (/^neoforge-21\.1\.\d+-installer\.jar$/i.test(entry)) {
-            candidates.push(path.join(this.installerCacheDir, entry));
+  private findCachedInstaller(extraDirs: string[] = []): string | null {
+    const searchDirs = [
+      this.installerCacheDir,
+      ...extraDirs,
+      this.config?.minecraftDir,
+      this.config?.serverDir,
+      path.join(os.homedir(), 'Downloads'),
+    ].filter((d): d is string => Boolean(d));
+
+    const candidates: string[] = [];
+    for (const dir of searchDirs) {
+      candidates.push(path.join(dir, `neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`));
+      try {
+        if (fs.existsSync(dir)) {
+          for (const entry of fs.readdirSync(dir)) {
+            if (/^neoforge-21\.1\.\d+-installer\.jar$/i.test(entry)) {
+              candidates.push(path.join(dir, entry));
+            }
           }
         }
+      } catch {
+        // ignore unreadable dir
       }
-    } catch {
-      // ignore
     }
+
     for (const c of candidates) {
       try {
         if (fs.existsSync(c) && fs.statSync(c).size > 100_000) {
@@ -523,12 +538,58 @@ export class CoreBackendService extends EventEmitter {
     return code ? `${code}: ${err.message}` : err.message;
   }
 
+  private getHostSafe(url: string): string {
+    try {
+      return new URL(url).host.toLowerCase();
+    } catch {
+      return '';
+    }
+  }
+
+  private buildMirrorUrls(originalUrl: string, relMavenPath?: string): string[] {
+    const candidates: string[] = [];
+    const add = (u: string) => {
+      if (u && !candidates.includes(u)) candidates.push(u);
+    };
+
+    const cleanRel = relMavenPath ? relMavenPath.replace(/^[/\\]+/, '') : '';
+    let derivedMavenPath = cleanRel;
+
+    if (!derivedMavenPath) {
+      const nfMatch = originalUrl.match(/^https?:\/\/maven\.neoforged\.net\/releases\/(.+)$/i);
+      const mcLibMatch = originalUrl.match(/^https?:\/\/libraries\.minecraft\.net\/(.+)$/i);
+      const mcCentralMatch = originalUrl.match(/^https?:\/\/repo1\.maven\.org\/maven2\/(.+)$/i);
+      derivedMavenPath = nfMatch?.[1] || mcLibMatch?.[1] || mcCentralMatch?.[1] || '';
+    }
+
+    add(originalUrl);
+
+    if (derivedMavenPath) {
+      add(`${BMCLAPI_MAVEN_BASE}/${derivedMavenPath}`);
+      add(`${MAVEN_CENTRAL_BASE}/${derivedMavenPath}`);
+      add(`${ALIYUN_MAVEN_BASE}/${derivedMavenPath}`);
+    } else if (/^https:\/\/(piston-meta|piston-data|launchermeta|launcher)\.mojang\.com\//i.test(originalUrl)) {
+      add(
+        originalUrl.replace(
+          /^https:\/\/(piston-meta|piston-data|launchermeta|launcher)\.mojang\.com/i,
+          'https://bmclapi2.bangbang93.com'
+        )
+      );
+    }
+
+    // Move already-detected blocked/unreachable hosts to the end so healthy mirrors run immediately
+    const healthy = candidates.filter((u) => !this.blockedHosts.has(this.getHostSafe(u)));
+    const deprioritized = candidates.filter((u) => this.blockedHosts.has(this.getHostSafe(u)));
+    return [...healthy, ...deprioritized];
+  }
+
   private async downloadViaNodeHttp(
     url: string,
     destPath: string | null,
     family: 4 | 0,
     onProgress?: (received: number, total: number) => void,
-    redirectDepth = 0
+    redirectDepth = 0,
+    timeoutMs = 12_000
   ): Promise<Buffer> {
     if (redirectDepth > 6) {
       throw new Error('Слишком много HTTP-перенаправлений');
@@ -548,14 +609,14 @@ export class CoreBackendService extends EventEmitter {
             'User-Agent': 'NeoCraft-Control/1.0 (Linux/Windows)',
             Accept: '*/*',
           },
-          timeout: 30_000,
+          timeout: timeoutMs,
         },
         (res) => {
           const status = res.statusCode ?? 0;
           if (status >= 300 && status < 400 && res.headers.location) {
             res.resume();
             const nextUrl = new URL(res.headers.location, parsedUrl).toString();
-            void this.downloadViaNodeHttp(nextUrl, destPath, family, onProgress, redirectDepth + 1)
+            void this.downloadViaNodeHttp(nextUrl, destPath, family, onProgress, redirectDepth + 1, timeoutMs)
               .then(resolve)
               .catch(reject);
             return;
@@ -627,7 +688,7 @@ export class CoreBackendService extends EventEmitter {
           if (code === 0 && fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
             resolve();
           } else {
-            reject(new Error(`${cmd} завершился с кодом ${code ?? 1}${stderr.trim() ? `: ${stderr.trim().slice(-160)}` : ''}`));
+            reject(new Error(`${cmd} завершился с кодом ${code ?? 1}${stderr.trim() ? `: ${stderr.trim().slice(-140)}` : ''}`));
           }
         });
       });
@@ -637,11 +698,11 @@ export class CoreBackendService extends EventEmitter {
         '-4',
         '-fsSL',
         '--retry',
-        '2',
+        '1',
         '--connect-timeout',
-        '20',
+        '8',
         '--max-time',
-        '180',
+        '90',
         '-A',
         'NeoCraft-Control/1.0',
         '-o',
@@ -649,30 +710,11 @@ export class CoreBackendService extends EventEmitter {
         url,
       ]);
       return;
-    } catch {
-      // Retry curl without -4 (for IPv6-only networks) before falling back to wget
-      try {
-        await runCli('curl', [
-          '-fsSL',
-          '--retry',
-          '1',
-          '--connect-timeout',
-          '20',
-          '--max-time',
-          '180',
-          '-A',
-          'NeoCraft-Control/1.0',
-          '-o',
-          destPath,
-          url,
-        ]);
-        return;
-      } catch (curlErr) {
-        if (process.platform === 'win32') {
-          throw curlErr;
-        }
-        await runCli('wget', ['-q', '--tries=2', '--timeout=20', '-O', destPath, url]);
+    } catch (curlErr) {
+      if (process.platform === 'win32') {
+        throw curlErr;
       }
+      await runCli('wget', ['-q', '--tries=1', '--timeout=10', '-O', destPath, url]);
     }
   }
 
@@ -691,25 +733,22 @@ export class CoreBackendService extends EventEmitter {
       }
     };
 
-    // 1. Node https.get forced IPv4 (fixes Linux undici fetch failed / broken IPv6 routing)
+    // 1. Node https.get forced IPv4
     try {
       cleanupPartial();
-      await this.downloadViaNodeHttp(url, destPath, 4, onProgress);
+      await this.downloadViaNodeHttp(url, destPath, 4, onProgress, 0, 12_000);
       if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
     } catch (err) {
-      errors.push(`IPv4: ${this.formatNetworkError(err)}`);
+      const msg = this.formatNetworkError(err);
+      errors.push(`IPv4: ${msg}`);
+      // Don't retry 404 across IPv6/curl for the same URL
+      if (/HTTP 404\b/.test(msg)) {
+        cleanupPartial();
+        throw new Error(msg);
+      }
     }
 
-    // 2. Node https.get default IP family (IPv6 fallback)
-    try {
-      cleanupPartial();
-      await this.downloadViaNodeHttp(url, destPath, 0, onProgress);
-      if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
-    } catch (err) {
-      errors.push(`HTTPS: ${this.formatNetworkError(err)}`);
-    }
-
-    // 3. System curl / wget fallback (respects Linux system CA store & HTTP_PROXY/HTTPS_PROXY)
+    // 2. System curl / wget fallback (respects Linux system CA store & HTTP_PROXY/HTTPS_PROXY)
     try {
       cleanupPartial();
       await this.downloadViaCliTool(url, destPath);
@@ -718,25 +757,58 @@ export class CoreBackendService extends EventEmitter {
       errors.push(`CLI: ${this.formatNetworkError(err)}`);
     }
 
+    // 3. Node https.get default IP family (IPv6-only networks)
+    try {
+      cleanupPartial();
+      await this.downloadViaNodeHttp(url, destPath, 0, onProgress, 0, 10_000);
+      if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
+    } catch (err) {
+      errors.push(`HTTPS: ${this.formatNetworkError(err)}`);
+    }
+
     cleanupPartial();
     throw new Error(errors.join(' | ') || 'сетевая ошибка загрузки');
+  }
+
+  private async downloadWithMirrorsToFile(
+    urls: string[],
+    destPath: string,
+    onProgress?: (received: number, total: number) => void
+  ): Promise<string> {
+    const errors: string[] = [];
+    for (const url of urls) {
+      const host = this.getHostSafe(url);
+      try {
+        await this.downloadUrlToFile(url, destPath, onProgress);
+        return url;
+      } catch (err) {
+        const msg = this.formatNetworkError(err);
+        errors.push(`${host}: ${msg}`);
+        if (/ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|socket hang up|code 28|code 7|code 35|code 56/i.test(msg) && host) {
+          if (!this.blockedHosts.has(host)) {
+            this.blockedHosts.add(host);
+            this.appendLog(
+              'WARN',
+              'system',
+              `Хост ${host} недоступен или заблокирован (${msg.slice(0, 90)}) — переключаюсь на зеркала (BMCLAPI / Maven Central).`
+            );
+          }
+        }
+      }
+    }
+    throw new Error(errors.join(' || ') || 'не удалось скачать файл ни с одного зеркала');
   }
 
   private async downloadUrlToBuffer(url: string): Promise<Buffer> {
     const errors: string[] = [];
 
     try {
-      const buf = await this.downloadViaNodeHttp(url, null, 4);
+      const buf = await this.downloadViaNodeHttp(url, null, 4, undefined, 0, 12_000);
       if (buf.length > 0) return buf;
     } catch (err) {
-      errors.push(`IPv4: ${this.formatNetworkError(err)}`);
-    }
-
-    try {
-      const buf = await this.downloadViaNodeHttp(url, null, 0);
-      if (buf.length > 0) return buf;
-    } catch (err) {
-      errors.push(`HTTPS: ${this.formatNetworkError(err)}`);
+      const msg = this.formatNetworkError(err);
+      errors.push(`IPv4: ${msg}`);
+      if (/HTTP 404\b/.test(msg)) throw new Error(msg);
     }
 
     const tmpFile = path.join(os.tmpdir(), `neocraft-dl-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`);
@@ -754,11 +826,287 @@ export class CoreBackendService extends EventEmitter {
       }
     }
 
+    try {
+      const buf = await this.downloadViaNodeHttp(url, null, 0, undefined, 0, 10_000);
+      if (buf.length > 0) return buf;
+    } catch (err) {
+      errors.push(`HTTPS: ${this.formatNetworkError(err)}`);
+    }
+
     throw new Error(errors.join(' | ') || 'сетевая ошибка загрузки');
   }
 
-  private async downloadNeoForgeInstaller(): Promise<string> {
-    const existing = this.findCachedInstaller();
+  private async downloadWithMirrorsToBuffer(urls: string[]): Promise<Buffer> {
+    const errors: string[] = [];
+    for (const url of urls) {
+      const host = this.getHostSafe(url);
+      try {
+        return await this.downloadUrlToBuffer(url);
+      } catch (err) {
+        const msg = this.formatNetworkError(err);
+        errors.push(`${host}: ${msg}`);
+        if (/ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|socket hang up|code 28|code 7|code 35|code 56/i.test(msg) && host) {
+          this.blockedHosts.add(host);
+        }
+      }
+    }
+    throw new Error(errors.join(' || ') || 'не удалось загрузить данные ни с одного зеркала');
+  }
+
+  private readTextEntryFromZip(zipPath: string, targetEntryName: string): string | null {
+    try {
+      const buf = fs.readFileSync(zipPath);
+      const normalizedTarget = targetEntryName.replace(/^\/+/, '');
+
+      // Locate End of Central Directory (EOCD) signature 0x06054b50
+      const minEocdOffset = Math.max(0, buf.length - 65_557);
+      let eocdOffset = -1;
+      for (let i = buf.length - 22; i >= minEocdOffset; i--) {
+        if (buf.readUInt32LE(i) === 0x06054b50) {
+          eocdOffset = i;
+          break;
+        }
+      }
+      if (eocdOffset < 0) return null;
+
+      const totalEntries = buf.readUInt16LE(eocdOffset + 10);
+      let cdOffset = buf.readUInt32LE(eocdOffset + 16);
+
+      for (let idx = 0; idx < totalEntries && cdOffset + 46 <= buf.length; idx++) {
+        if (buf.readUInt32LE(cdOffset) !== 0x02014b50) break;
+        const compressionMethod = buf.readUInt16LE(cdOffset + 10);
+        const compressedSize = buf.readUInt32LE(cdOffset + 20);
+        const nameLen = buf.readUInt16LE(cdOffset + 28);
+        const extraLen = buf.readUInt16LE(cdOffset + 30);
+        const commentLen = buf.readUInt16LE(cdOffset + 32);
+        const localHeaderOffset = buf.readUInt32LE(cdOffset + 42);
+        const entryName = buf
+          .subarray(cdOffset + 46, cdOffset + 46 + nameLen)
+          .toString('utf8')
+          .replace(/^\/+/, '');
+
+        if (entryName === normalizedTarget) {
+          if (localHeaderOffset + 30 > buf.length || buf.readUInt32LE(localHeaderOffset) !== 0x04034b50) {
+            return null;
+          }
+          const localNameLen = buf.readUInt16LE(localHeaderOffset + 26);
+          const localExtraLen = buf.readUInt16LE(localHeaderOffset + 28);
+          const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+          const compressed = buf.subarray(dataStart, dataStart + compressedSize);
+          if (compressionMethod === 0) {
+            return compressed.toString('utf8');
+          }
+          if (compressionMethod === 8) {
+            return zlib.inflateRawSync(compressed).toString('utf8');
+          }
+          return null;
+        }
+
+        cdOffset += 46 + nameLen + extraLen + commentLen;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private mavenCoordToRelPath(coord: string): string | null {
+    const clean = coord.trim().replace(/^\[|\]$/g, '');
+    const [mainPart, extPart] = clean.split('@');
+    const ext = extPart || 'jar';
+    const parts = mainPart.split(':');
+    if (parts.length < 3) return null;
+    const [group, artifact, version, classifier] = parts;
+    const groupPath = group.replace(/\./g, '/');
+    const fileName = classifier
+      ? `${artifact}-${version}-${classifier}.${ext}`
+      : `${artifact}-${version}.${ext}`;
+    return `${groupPath}/${artifact}/${version}/${fileName}`;
+  }
+
+  private async preDownloadInstallerDependencies(
+    installerJar: string,
+    targetDir: string,
+    side: 'client' | 'server',
+    onProgress?: (detail: string) => void
+  ): Promise<{ total: number; verified: number; downloaded: number; failed: string[] }> {
+    const librariesRoot = path.resolve(path.join(targetDir, 'libraries'));
+    fs.mkdirSync(librariesRoot, { recursive: true });
+
+    const profileText = this.readTextEntryFromZip(installerJar, 'install_profile.json');
+    const versionText = this.readTextEntryFromZip(installerJar, 'version.json');
+
+    type ArtifactTask = { relPath: string; url: string; size?: number; name: string };
+    const taskMap = new Map<string, ArtifactTask>();
+
+    const collectLibs = (jsonText: string | null) => {
+      if (!jsonText) return;
+      try {
+        const parsed = JSON.parse(jsonText) as { libraries?: unknown[] };
+        if (!Array.isArray(parsed.libraries)) return;
+        for (const item of parsed.libraries) {
+          if (typeof item !== 'object' || item === null) continue;
+          const lib = item as {
+            name?: string;
+            downloads?: { artifact?: { path?: string; url?: string; size?: number } };
+          };
+          const art = lib.downloads?.artifact;
+          if (!art?.path || !art?.url) continue;
+          const relPath = art.path.replace(/^[/\\]+/, '');
+          if (!taskMap.has(relPath)) {
+            taskMap.set(relPath, {
+              relPath,
+              url: art.url,
+              size: art.size,
+              name: lib.name || path.basename(relPath),
+            });
+          }
+        }
+      } catch {
+        // ignore malformed zip json
+      }
+    };
+
+    collectLibs(profileText);
+    collectLibs(versionText);
+
+    const tasks = Array.from(taskMap.values());
+    let verified = 0;
+    let downloaded = 0;
+    const failed: string[] = [];
+
+    const missingTasks: ArtifactTask[] = [];
+    for (const task of tasks) {
+      const destPath = path.resolve(librariesRoot, task.relPath);
+      if (destPath !== librariesRoot && !destPath.startsWith(librariesRoot + path.sep)) continue;
+      let ok = false;
+      if (fs.existsSync(destPath)) {
+        try {
+          const stat = fs.statSync(destPath);
+          ok = stat.isFile() && stat.size > 0 && (!task.size || stat.size === task.size);
+        } catch {
+          ok = false;
+        }
+      }
+      if (ok) {
+        verified++;
+      } else {
+        missingTasks.push(task);
+      }
+    }
+
+    if (missingTasks.length > 0) {
+      onProgress?.(`Предзагрузка библиотек через зеркала: 0/${missingTasks.length}...`);
+      this.appendLog(
+        'SYSTEM',
+        'system',
+        `Предзагрузка ${missingTasks.length} библиотек NeoForge (с автопереключением на BMCLAPI / Maven Central)...`
+      );
+
+      let cursor = 0;
+      let completed = 0;
+      const concurrency = 6;
+
+      const worker = async () => {
+        while (cursor < missingTasks.length) {
+          const idx = cursor++;
+          const task = missingTasks[idx];
+          const destPath = path.resolve(librariesRoot, task.relPath);
+          const urls = this.buildMirrorUrls(task.url, task.relPath);
+          try {
+            await this.downloadWithMirrorsToFile(urls, destPath);
+            downloaded++;
+          } catch (err) {
+            failed.push(`${task.name} (${this.formatNetworkError(err).slice(0, 100)})`);
+          }
+          completed++;
+          if (completed % 4 === 0 || completed === missingTasks.length) {
+            onProgress?.(
+              `Предзагрузка библиотек через зеркала: ${completed}/${missingTasks.length}...`
+            );
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: Math.min(concurrency, missingTasks.length) }, () => worker()));
+    }
+
+    // For client installs, also pre-download vanilla 1.21.1.jar and client_mappings via mirrors
+    // so SimpleInstaller never fails when Mojang/NeoForge direct CDN is throttled
+    if (side === 'client') {
+      try {
+        const vanillaManifest = await this.fetchVanillaVersionManifest(targetDir, NEOFORGE_MC_VERSION);
+        const downloads =
+          vanillaManifest && typeof vanillaManifest.downloads === 'object' && vanillaManifest.downloads !== null
+            ? (vanillaManifest.downloads as {
+                client?: { url?: string; size?: number };
+                client_mappings?: { url?: string; size?: number };
+              })
+            : null;
+
+        if (downloads?.client?.url) {
+          const clientJarPath = path.join(
+            targetDir,
+            'versions',
+            NEOFORGE_MC_VERSION,
+            `${NEOFORGE_MC_VERSION}.jar`
+          );
+          const hasClientJar =
+            fs.existsSync(clientJarPath) &&
+            fs.statSync(clientJarPath).size > 1_000_000 &&
+            (!downloads.client.size || fs.statSync(clientJarPath).size === downloads.client.size);
+          if (!hasClientJar) {
+            onProgress?.(`Загрузка Minecraft ${NEOFORGE_MC_VERSION}.jar через зеркала...`);
+            const clientUrls = [
+              ...this.buildMirrorUrls(downloads.client.url),
+              `https://bmclapi2.bangbang93.com/version/${NEOFORGE_MC_VERSION}/client`,
+            ];
+            await this.downloadWithMirrorsToFile(clientUrls, clientJarPath);
+          }
+        }
+
+        if (downloads?.client_mappings?.url && profileText) {
+          try {
+            const parsedProfile = JSON.parse(profileText) as {
+              data?: { MOJMAPS?: { client?: string } };
+            };
+            const mojmapsCoord = parsedProfile.data?.MOJMAPS?.client;
+            const relMapsPath = mojmapsCoord ? this.mavenCoordToRelPath(mojmapsCoord) : null;
+            if (relMapsPath) {
+              const mapsDest = path.resolve(librariesRoot, relMapsPath);
+              const hasMaps =
+                fs.existsSync(mapsDest) &&
+                fs.statSync(mapsDest).size > 100_000 &&
+                (!downloads.client_mappings.size ||
+                  fs.statSync(mapsDest).size === downloads.client_mappings.size);
+              if (!hasMaps) {
+                onProgress?.('Загрузка маппингов Minecraft 1.21.1 через зеркала...');
+                await this.downloadWithMirrorsToFile(
+                  this.buildMirrorUrls(downloads.client_mappings.url),
+                  mapsDest
+                );
+              }
+            }
+          } catch {
+            // non-fatal, SimpleInstaller can still attempt download
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }
+
+    this.appendLog(
+      'SYSTEM',
+      'system',
+      `Предзагрузка библиотек завершена: уже на диске ${verified}, скачано ${downloaded}, ошибок ${failed.length}.`
+    );
+
+    return { total: tasks.length, verified, downloaded, failed };
+  }
+
+  private async downloadNeoForgeInstaller(extraSearchDirs: string[] = []): Promise<string> {
+    const existing = this.findCachedInstaller(extraSearchDirs);
     if (existing) {
       this.appendLog('SYSTEM', 'system', `Используется предзагруженный установщик NeoForge: ${existing}`);
       this.emitInstallProgress('Найден предзагруженный установщик NeoForge 21.1.267', 35);
@@ -770,16 +1118,31 @@ export class CoreBackendService extends EventEmitter {
 
     const tryDownloadVersion = async (version: string): Promise<string | null> => {
       if (!/^21\.1\.\d+$/.test(version)) return null;
-      const url = `${NEOFORGE_MAVEN_BASE}/${version}/neoforge-${version}-installer.jar`;
+      const relPath = `net/neoforged/neoforge/${version}/neoforge-${version}-installer.jar`;
+      const primaryUrl = `${NEOFORGE_MAVEN_BASE}/${version}/neoforge-${version}-installer.jar`;
+      const mirrorUrls = [
+        primaryUrl,
+        `${BMCLAPI_MAVEN_BASE}/${relPath}`,
+      ];
+      // Put healthy hosts first
+      const orderedUrls = [
+        ...mirrorUrls.filter((u) => !this.blockedHosts.has(this.getHostSafe(u))),
+        ...mirrorUrls.filter((u) => this.blockedHosts.has(this.getHostSafe(u))),
+      ];
+
       const targetPath = path.join(this.installerCacheDir, `neoforge-${version}-installer.jar`);
       const tempPath = `${targetPath}.part`;
 
-      this.appendLog('SYSTEM', 'system', `Загрузка официального установщика NeoForge ${version} с maven.neoforged.net...`);
+      this.appendLog(
+        'SYSTEM',
+        'system',
+        `Загрузка официального установщика NeoForge ${version} (maven.neoforged.net / зеркало BMCLAPI)...`
+      );
       this.emitInstallProgress(`Загрузка neoforge-${version}-installer.jar...`, 12);
 
       let lastPct = 12;
       try {
-        await this.downloadUrlToFile(url, tempPath, (received, totalBytes) => {
+        await this.downloadWithMirrorsToFile(orderedUrls, tempPath, (received, totalBytes) => {
           if (totalBytes > 0) {
             const pct = Math.min(44, 12 + Math.round((received / totalBytes) * 32));
             if (pct > lastPct + 2) {
@@ -814,14 +1177,17 @@ export class CoreBackendService extends EventEmitter {
       }
     };
 
-    // 1. Try target NeoForge 21.1.267 first
+    // 1. Try target NeoForge 21.1.267 first (direct + BMCLAPI mirror)
     let downloaded = await tryDownloadVersion(NEOFORGE_LOADER_VERSION);
 
-    // 2. Fallback to latest published 21.1.x from official maven-metadata.xml if 21.1.267 is unavailable
+    // 2. Fallback to latest published 21.1.x from maven-metadata.xml (direct + BMCLAPI mirror)
     if (!downloaded) {
-      this.emitInstallProgress('Поиск актуальной сборки NeoForge 21.1.x в официальном Maven...', 10);
+      this.emitInstallProgress('Поиск актуальной сборки NeoForge 21.1.x в зеркалах Maven...', 10);
       try {
-        const xmlBuf = await this.downloadUrlToBuffer(`${NEOFORGE_MAVEN_BASE}/maven-metadata.xml`);
+        const xmlBuf = await this.downloadWithMirrorsToBuffer([
+          `${NEOFORGE_MAVEN_BASE}/maven-metadata.xml`,
+          `${BMCLAPI_MAVEN_BASE}/net/neoforged/neoforge/maven-metadata.xml`,
+        ]);
         const xml = xmlBuf.toString('utf8');
         const matches = Array.from(xml.matchAll(/<version>(21\.1\.\d+)<\/version>/g)).map((m) => m[1]);
         const latest211 = matches.sort((a, b) => {
@@ -844,7 +1210,7 @@ export class CoreBackendService extends EventEmitter {
 
     if (!downloaded) {
       throw new Error(
-        `Не удалось скачать установщик NeoForge 1.21.1 с maven.neoforged.net${lastErrorReason ? ` (${lastErrorReason})` : ''}. Проверьте доступ к интернету или положите neoforge-21.1.267-installer.jar в папку .minecraft.`
+        `Не удалось скачать установщик NeoForge 1.21.1 ни с maven.neoforged.net, ни с зеркала BMCLAPI${lastErrorReason ? ` (${lastErrorReason})` : ''}. Положите neoforge-21.1.267-installer.jar в папку .minecraft или ~/Downloads.`
       );
     }
 
@@ -925,51 +1291,87 @@ export class CoreBackendService extends EventEmitter {
         );
       }
 
-      const installerPath = await this.downloadNeoForgeInstaller();
+      const installerPath = await this.downloadNeoForgeInstaller([targetDir]);
+
+      // Pre-download all libraries (commons-collections, asm, etc.) via multi-mirror engine
+      // so blocked maven.neoforged.net never stalls SimpleInstaller --installServer
+      this.emitInstallProgress('Предзагрузка библиотек NeoForge через зеркала...', 47);
+      await this.preDownloadInstallerDependencies(installerPath, targetDir, 'server', (detail) => {
+        this.emitInstallProgress(detail, 49);
+      });
+
+      const runServerInstaller = (extraArgs: string[]) =>
+        new Promise<{ code: number; output: string }>((resolve, reject) => {
+          let output = '';
+          const proc = spawn(
+            this.config.javaPath,
+            [
+              '-Djava.net.preferIPv4Stack=true',
+              '-Djava.awt.headless=true',
+              '-jar',
+              installerPath,
+              '--installServer',
+              ...extraArgs,
+            ],
+            {
+              cwd: targetDir,
+              shell: false,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            }
+          );
+
+          let progressPct = 52;
+          const onChunk = (chunk: Buffer, isErr: boolean) => {
+            const text = chunk.toString('utf8');
+            output += text;
+            for (const rawLine of text.split(/\r?\n/)) {
+              const line = rawLine.trim();
+              if (!line) continue;
+              this.appendLog(isErr ? 'WARN' : 'INFO', isErr ? 'stderr' : 'stdout', `[Installer] ${line}`);
+              if (progressPct < 94) {
+                progressPct = Math.min(94, progressPct + 1);
+                this.emitInstallProgress(`Установка NeoForge: ${line.slice(0, 72)}`, progressPct);
+              }
+            }
+          };
+
+          proc.stdout.on('data', (c: Buffer) => onChunk(c, false));
+          proc.stderr.on('data', (c: Buffer) => onChunk(c, true));
+          proc.on('error', (err) => reject(err));
+          proc.on('close', (code) => resolve({ code: code ?? 1, output }));
+        });
 
       this.emitInstallProgress(
         'Установка серверных библиотек NeoForge 1.21.1 (--installServer)... Это займёт 1–2 минуты.',
         50
       );
+      const preferMirror = this.blockedHosts.has('maven.neoforged.net');
+      const primaryArgs = preferMirror ? ['--mirror', BMCLAPI_MAVEN_BASE] : [];
       this.appendLog(
         'SYSTEM',
         'system',
-        `Запуск установки ядра: "${this.config.javaPath}" -jar "${installerPath}" --installServer`
+        `Запуск установки ядра: "${this.config.javaPath}" -jar "${installerPath}" --installServer ${primaryArgs.join(' ')}`.trim()
       );
 
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn(
-          this.config.javaPath,
-          ['-Djava.net.preferIPv4Stack=true', '-Djava.awt.headless=true', '-jar', installerPath, '--installServer'],
-          {
-            cwd: targetDir,
-            shell: false,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          }
+      let srvOutcome = await runServerInstaller(primaryArgs);
+      if (srvOutcome.code !== 0 && !preferMirror) {
+        this.appendLog(
+          'WARN',
+          'system',
+          `Установщик сервера завершился с кодом ${srvOutcome.code}. Повторный запуск с зеркалом BMCLAPI (--mirror)...`
         );
-
-        let progressPct = 52;
-        const onChunk = (chunk: Buffer, isErr: boolean) => {
-          const text = chunk.toString('utf8');
-          for (const rawLine of text.split(/\r?\n/)) {
-            const line = rawLine.trim();
-            if (!line) continue;
-            this.appendLog(isErr ? 'WARN' : 'INFO', isErr ? 'stderr' : 'stdout', `[Installer] ${line}`);
-            if (progressPct < 94) {
-              progressPct = Math.min(94, progressPct + 1);
-              this.emitInstallProgress(`Установка NeoForge: ${line.slice(0, 72)}`, progressPct);
-            }
-          }
-        };
-
-        proc.stdout.on('data', (c: Buffer) => onChunk(c, false));
-        proc.stderr.on('data', (c: Buffer) => onChunk(c, true));
-        proc.on('error', (err) => reject(err));
-        proc.on('close', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`Установщик NeoForge завершился с кодом ${code}.`));
-        });
-      });
+        this.emitInstallProgress('Повторная установка NeoForge через зеркало BMCLAPI...', 55);
+        srvOutcome = await runServerInstaller(['--mirror', BMCLAPI_MAVEN_BASE]);
+      }
+      if (srvOutcome.code !== 0) {
+        const tail = srvOutcome.output
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .slice(-3)
+          .join(' | ');
+        throw new Error(`Установщик NeoForge завершился с кодом ${srvOutcome.code}${tail ? `: ${tail}` : ''}`);
+      }
 
       this.syncAutoDetectedCorePath();
       const verifiedArgs = this.findNeoForgeArgsFile(targetDir);
@@ -2457,26 +2859,38 @@ export class CoreBackendService extends EventEmitter {
           );
         }
 
-        // Locate existing or cached installer, or download automatically from maven.neoforged.net
-        const localInstaller = path.join(
-          minecraftDir,
-          `neoforge-${NEOFORGE_LOADER_VERSION}-installer.jar`
+        // Locate existing or cached installer (.minecraft / cache / serverDir / Downloads), or download via mirrors
+        this.emitClientStep(
+          'neoforge',
+          'running',
+          'Поиск или загрузка установщика NeoForge 1.21.1 (maven.neoforged.net / зеркало BMCLAPI)...'
         );
-        let installerJar: string;
-        if (fs.existsSync(localInstaller) && fs.statSync(localInstaller).size > 100_000) {
-          installerJar = localInstaller;
-        } else {
-          this.emitClientStep(
-            'neoforge',
-            'running',
-            'Загрузка официального установщика NeoForge 1.21.1 с maven.neoforged.net...'
-          );
-          installerJar = await this.downloadNeoForgeInstaller();
-        }
+        const installerJar = await this.downloadNeoForgeInstaller([minecraftDir]);
 
         const verMatch = path.basename(installerJar).match(/neoforge-(21\.1\.\d+)-installer\.jar/i);
         if (verMatch?.[1]) {
           installedLoaderVer = verMatch[1];
+        }
+
+        // Pre-download ALL install_profile.json & version.json libraries (including commons-collections, asm, bootstraplauncher)
+        // plus vanilla 1.21.1.jar & mappings via multi-mirror engine (BMCLAPI + Maven Central + Aliyun)
+        this.emitClientStep(
+          'neoforge',
+          'running',
+          'Предзагрузка библиотек NeoForge (commons-collections, ASM, BootstrapLauncher) через зеркала...'
+        );
+        const preDl = await this.preDownloadInstallerDependencies(
+          installerJar,
+          minecraftDir,
+          'client',
+          (detail) => this.emitClientStep('neoforge', 'running', detail)
+        );
+        if (preDl.failed.length > 0) {
+          this.appendLog(
+            'WARN',
+            'system',
+            `Часть библиотек не удалось предзагрузить (${preDl.failed.length}): ${preDl.failed.slice(0, 3).join('; ')}`
+          );
         }
 
         // Official NeoForge --installClient requires launcher_profiles.json inside .minecraft
@@ -2498,12 +2912,20 @@ export class CoreBackendService extends EventEmitter {
           );
         }
 
-        const runClientInstaller = (flag: '--installClient' | '--install-client') =>
+        const runClientInstaller = (flag: '--installClient' | '--install-client', extraArgs: string[] = []) =>
           new Promise<{ code: number; output: string }>((resolve, reject) => {
             let output = '';
             const installerProc = spawn(
               javaExe,
-              ['-Djava.net.preferIPv4Stack=true', '-Djava.awt.headless=true', '-jar', installerJar, flag, minecraftDir],
+              [
+                '-Djava.net.preferIPv4Stack=true',
+                '-Djava.awt.headless=true',
+                '-jar',
+                installerJar,
+                flag,
+                minecraftDir,
+                ...extraArgs,
+              ],
               { cwd: minecraftDir, shell: false }
             );
 
@@ -2529,23 +2951,58 @@ export class CoreBackendService extends EventEmitter {
             installerProc.on('close', (code) => resolve({ code: code ?? 1, output }));
           });
 
+        const preferMirror = this.blockedHosts.has('maven.neoforged.net');
+        const primaryExtraArgs = preferMirror ? ['--mirror', BMCLAPI_MAVEN_BASE] : [];
+
         this.emitClientStep(
           'neoforge',
           'running',
-          `Установка библиотек NeoForge ${installedLoaderVer} (--installClient)... Это займёт 1–2 минуты.`
+          `Сборка клиентских библиотек NeoForge ${installedLoaderVer} (--installClient${preferMirror ? ' --mirror BMCLAPI' : ''})...`
         );
         this.appendLog(
           'SYSTEM',
           'system',
-          `Запуск установки клиента NeoForge: "${javaExe}" -Djava.awt.headless=true -jar "${installerJar}" --installClient "${minecraftDir}"`
+          `Запуск установки клиента NeoForge: "${javaExe}" -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -jar "${installerJar}" --installClient "${minecraftDir}" ${primaryExtraArgs.join(' ')}`.trim()
         );
 
-        let installOutcome = await runClientInstaller('--installClient');
+        let clientFlag: '--installClient' | '--install-client' = '--installClient';
+        let installOutcome = await runClientInstaller(clientFlag, primaryExtraArgs);
         if (
           installOutcome.code !== 0 &&
           /unrecognized|not a recognized option|unknown option/i.test(installOutcome.output)
         ) {
-          installOutcome = await runClientInstaller('--install-client');
+          clientFlag = '--install-client';
+          installOutcome = await runClientInstaller(clientFlag, primaryExtraArgs);
+        }
+
+        // Retry with BMCLAPI mirror if primary direct download failed inside SimpleInstaller
+        if (installOutcome.code !== 0 && !preferMirror) {
+          this.appendLog(
+            'WARN',
+            'system',
+            `Инсталлятор завершился с кодом ${installOutcome.code}. Повтор с зеркалом BMCLAPI (--mirror)...`
+          );
+          this.emitClientStep(
+            'neoforge',
+            'running',
+            'Повторная установка NeoForge через зеркало BMCLAPI (--mirror)...'
+          );
+          installOutcome = await runClientInstaller(clientFlag, ['--mirror', BMCLAPI_MAVEN_BASE]);
+        }
+
+        // Final retry in --offline mode if all dependencies were already pre-downloaded locally
+        if (installOutcome.code !== 0 && preDl.failed.length === 0) {
+          this.appendLog(
+            'WARN',
+            'system',
+            'Повторный запуск инсталлятора в офлайн-режиме (--offline) по предзагруженным библиотекам...'
+          );
+          this.emitClientStep(
+            'neoforge',
+            'running',
+            'Завершение сборки NeoForge по предзагруженным библиотекам (--offline)...'
+          );
+          installOutcome = await runClientInstaller(clientFlag, ['--offline']);
         }
 
         if (installOutcome.code !== 0) {
@@ -2878,8 +3335,8 @@ export class CoreBackendService extends EventEmitter {
     }
 
     try {
-      const metaBuf = await this.downloadUrlToBuffer(
-        'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
+      const metaBuf = await this.downloadWithMirrorsToBuffer(
+        this.buildMirrorUrls('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json')
       );
       const meta = JSON.parse(metaBuf.toString('utf8')) as {
         versions?: Array<{ id?: string; url?: string }>;
@@ -2889,7 +3346,7 @@ export class CoreBackendService extends EventEmitter {
         throw new Error(`Версия ${mcVersion} не найдена в version_manifest_v2.json`);
       }
 
-      const verBuf = await this.downloadUrlToBuffer(entry.url);
+      const verBuf = await this.downloadWithMirrorsToBuffer(this.buildMirrorUrls(entry.url));
       const vanillaJson = JSON.parse(verBuf.toString('utf8')) as Record<string, unknown>;
       fs.mkdirSync(localVanillaDir, { recursive: true });
       fs.writeFileSync(localVanillaJson, JSON.stringify(vanillaJson, null, 2), 'utf8');
@@ -2898,7 +3355,7 @@ export class CoreBackendService extends EventEmitter {
       this.appendLog(
         'WARN',
         'system',
-        `Не удалось получить манифест Minecraft ${mcVersion} с piston-meta.mojang.com (${this.formatNetworkError(err)}). Будет использован режим inheritsFrom с патчем JVM.`
+        `Не удалось получить манифест Minecraft ${mcVersion} (Mojang / BMCLAPI: ${this.formatNetworkError(err)}). Будет использован режим inheritsFrom с патчем JVM.`
       );
       return null;
     }
@@ -2958,7 +3415,7 @@ export class CoreBackendService extends EventEmitter {
 
       if (artifact.url && typeof artifact.url === 'string' && artifact.url.startsWith('https://')) {
         try {
-          await this.downloadUrlToFile(artifact.url, destPath);
+          await this.downloadWithMirrorsToFile(this.buildMirrorUrls(artifact.url, relPath), destPath);
           if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
             downloaded++;
             if (isBootstrap) bootstrapPath = destPath;
