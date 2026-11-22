@@ -1,9 +1,18 @@
 import { EventEmitter } from 'node:events';
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import crypto from 'node:crypto';
+import dns from 'node:dns';
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
+
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  // Ignore on older Node runtimes
+}
 import type {
   AppFullState,
   ClientDetectionResult,
@@ -503,6 +512,239 @@ export class CoreBackendService extends EventEmitter {
     return { ok: true };
   }
 
+  private formatNetworkError(err: unknown): string {
+    if (!(err instanceof Error)) return String(err || 'неизвестная сетевая ошибка');
+    const cause = (err as Error & { cause?: unknown }).cause;
+    if (cause instanceof Error) {
+      const code = (cause as Error & { code?: string }).code;
+      return code ? `${code}: ${cause.message}` : cause.message;
+    }
+    const code = (err as Error & { code?: string }).code;
+    return code ? `${code}: ${err.message}` : err.message;
+  }
+
+  private async downloadViaNodeHttp(
+    url: string,
+    destPath: string | null,
+    family: 4 | 0,
+    onProgress?: (received: number, total: number) => void,
+    redirectDepth = 0
+  ): Promise<Buffer> {
+    if (redirectDepth > 6) {
+      throw new Error('Слишком много HTTP-перенаправлений');
+    }
+    const parsedUrl = new URL(url);
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+      throw new Error(`Неподдерживаемый протокол: ${parsedUrl.protocol}`);
+    }
+
+    return new Promise<Buffer>((resolve, reject) => {
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+      const req = transport.get(
+        parsedUrl,
+        {
+          family: family === 4 ? 4 : undefined,
+          headers: {
+            'User-Agent': 'NeoCraft-Control/1.0 (Linux/Windows)',
+            Accept: '*/*',
+          },
+          timeout: 30_000,
+        },
+        (res) => {
+          const status = res.statusCode ?? 0;
+          if (status >= 300 && status < 400 && res.headers.location) {
+            res.resume();
+            const nextUrl = new URL(res.headers.location, parsedUrl).toString();
+            void this.downloadViaNodeHttp(nextUrl, destPath, family, onProgress, redirectDepth + 1)
+              .then(resolve)
+              .catch(reject);
+            return;
+          }
+
+          if (status < 200 || status >= 300) {
+            res.resume();
+            reject(new Error(`HTTP ${status}`));
+            return;
+          }
+
+          const totalBytes = Number(res.headers['content-length'] || 0);
+          let received = 0;
+
+          if (destPath) {
+            fs.mkdirSync(path.dirname(destPath), { recursive: true });
+            const fileStream = fs.createWriteStream(destPath);
+            fileStream.on('error', (err) => {
+              res.destroy();
+              reject(err);
+            });
+            res.on('data', (chunk: Buffer) => {
+              received += chunk.byteLength;
+              onProgress?.(received, totalBytes);
+            });
+            res.on('error', (err) => {
+              fileStream.destroy();
+              reject(err);
+            });
+            fileStream.on('finish', () => {
+              resolve(Buffer.alloc(0));
+            });
+            res.pipe(fileStream);
+          } else {
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: Buffer) => {
+              chunks.push(chunk);
+              received += chunk.byteLength;
+              onProgress?.(received, totalBytes);
+            });
+            res.on('error', reject);
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+          }
+        }
+      );
+
+      req.on('timeout', () => {
+        req.destroy(new Error('ETIMEDOUT: превышено время ожидания ответа сервера'));
+      });
+      req.on('error', reject);
+    });
+  }
+
+  private async downloadViaCliTool(url: string, destPath: string): Promise<void> {
+    if (!url.startsWith('https://')) {
+      throw new Error('Разрешены только HTTPS-ссылки');
+    }
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+
+    const runCli = (cmd: string, args: string[]) =>
+      new Promise<void>((resolve, reject) => {
+        let stderr = '';
+        const proc = spawn(cmd, args, { shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
+        proc.stderr.on('data', (c: Buffer) => {
+          stderr += c.toString('utf8');
+        });
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+          if (code === 0 && fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+            resolve();
+          } else {
+            reject(new Error(`${cmd} завершился с кодом ${code ?? 1}${stderr.trim() ? `: ${stderr.trim().slice(-160)}` : ''}`));
+          }
+        });
+      });
+
+    try {
+      await runCli('curl', [
+        '-4',
+        '-fsSL',
+        '--retry',
+        '2',
+        '--connect-timeout',
+        '20',
+        '--max-time',
+        '180',
+        '-A',
+        'NeoCraft-Control/1.0',
+        '-o',
+        destPath,
+        url,
+      ]);
+      return;
+    } catch {
+      // Retry curl without -4 (for IPv6-only networks) before falling back to wget
+      try {
+        await runCli('curl', [
+          '-fsSL',
+          '--retry',
+          '1',
+          '--connect-timeout',
+          '20',
+          '--max-time',
+          '180',
+          '-A',
+          'NeoCraft-Control/1.0',
+          '-o',
+          destPath,
+          url,
+        ]);
+        return;
+      } catch (curlErr) {
+        if (process.platform === 'win32') {
+          throw curlErr;
+        }
+        await runCli('wget', ['-q', '--tries=2', '--timeout=20', '-O', destPath, url]);
+      }
+    }
+  }
+
+  private async downloadUrlToFile(
+    url: string,
+    destPath: string,
+    onProgress?: (received: number, total: number) => void
+  ): Promise<void> {
+    const errors: string[] = [];
+
+    // 1. Node https.get forced IPv4 (fixes Linux undici fetch failed / broken IPv6 routing)
+    try {
+      await this.downloadViaNodeHttp(url, destPath, 4, onProgress);
+      if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
+    } catch (err) {
+      errors.push(`IPv4: ${this.formatNetworkError(err)}`);
+    }
+
+    // 2. Node https.get default IP family (IPv6 fallback)
+    try {
+      await this.downloadViaNodeHttp(url, destPath, 0, onProgress);
+      if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
+    } catch (err) {
+      errors.push(`HTTPS: ${this.formatNetworkError(err)}`);
+    }
+
+    // 3. System curl / wget fallback (respects Linux system CA store & HTTP_PROXY/HTTPS_PROXY)
+    try {
+      await this.downloadViaCliTool(url, destPath);
+      if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) return;
+    } catch (err) {
+      errors.push(`CLI: ${this.formatNetworkError(err)}`);
+    }
+
+    throw new Error(errors.join(' | ') || 'сетевая ошибка загрузки');
+  }
+
+  private async downloadUrlToBuffer(url: string): Promise<Buffer> {
+    const errors: string[] = [];
+
+    try {
+      const buf = await this.downloadViaNodeHttp(url, null, 4);
+      if (buf.length > 0) return buf;
+    } catch (err) {
+      errors.push(`IPv4: ${this.formatNetworkError(err)}`);
+    }
+
+    try {
+      const buf = await this.downloadViaNodeHttp(url, null, 0);
+      if (buf.length > 0) return buf;
+    } catch (err) {
+      errors.push(`HTTPS: ${this.formatNetworkError(err)}`);
+    }
+
+    const tmpFile = path.join(os.tmpdir(), `neocraft-dl-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`);
+    try {
+      await this.downloadViaCliTool(url, tmpFile);
+      const buf = fs.readFileSync(tmpFile);
+      if (buf.length > 0) return buf;
+    } catch (err) {
+      errors.push(`CLI: ${this.formatNetworkError(err)}`);
+    } finally {
+      try {
+        if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+      } catch {
+        // ignore
+      }
+    }
+
+    throw new Error(errors.join(' | ') || 'сетевая ошибка загрузки');
+  }
+
   private async downloadNeoForgeInstaller(): Promise<string> {
     const existing = this.findCachedInstaller();
     if (existing) {
@@ -512,6 +754,7 @@ export class CoreBackendService extends EventEmitter {
     }
 
     fs.mkdirSync(this.installerCacheDir, { recursive: true });
+    let lastErrorReason = '';
 
     const tryDownloadVersion = async (version: string): Promise<string | null> => {
       if (!/^21\.1\.\d+$/.test(version)) return null;
@@ -522,46 +765,41 @@ export class CoreBackendService extends EventEmitter {
       this.appendLog('SYSTEM', 'system', `Загрузка официального установщика NeoForge ${version} с maven.neoforged.net...`);
       this.emitInstallProgress(`Загрузка neoforge-${version}-installer.jar...`, 12);
 
-      const response = await fetch(url, { redirect: 'follow' });
-      if (!response.ok || !response.body) {
-        return null;
-      }
-
-      const totalBytes = Number(response.headers.get('content-length') || 0);
-      const fileStream = fs.createWriteStream(tempPath);
-      const reader = response.body.getReader();
-      let received = 0;
       let lastPct = 12;
-
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            fileStream.write(Buffer.from(value));
-            received += value.byteLength;
-            if (totalBytes > 0) {
-              const pct = Math.min(44, 12 + Math.round((received / totalBytes) * 32));
-              if (pct > lastPct + 2) {
-                lastPct = pct;
-                this.emitInstallProgress(
-                  `Загрузка neoforge-${version}-installer.jar (${(received / 1024 / 1024).toFixed(1)} МБ)...`,
-                  pct
-                );
-              }
+        await this.downloadUrlToFile(url, tempPath, (received, totalBytes) => {
+          if (totalBytes > 0) {
+            const pct = Math.min(44, 12 + Math.round((received / totalBytes) * 32));
+            if (pct > lastPct + 2) {
+              lastPct = pct;
+              this.emitInstallProgress(
+                `Загрузка neoforge-${version}-installer.jar (${(received / 1024 / 1024).toFixed(1)} МБ)...`,
+                pct
+              );
             }
           }
-        }
-      } finally {
-        await new Promise<void>((resolve) => fileStream.end(() => resolve()));
-      }
+        });
 
-      if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 100_000) {
-        fs.renameSync(tempPath, targetPath);
-        return targetPath;
+        if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 100_000) {
+          fs.renameSync(tempPath, targetPath);
+          return targetPath;
+        }
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        return null;
+      } catch (err) {
+        lastErrorReason = this.formatNetworkError(err);
+        this.appendLog(
+          'WARN',
+          'system',
+          `Не удалось скачать NeoForge ${version}: ${lastErrorReason}`
+        );
+        try {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        } catch {
+          // ignore
+        }
+        return null;
       }
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      return null;
     };
 
     // 1. Try target NeoForge 21.1.267 first
@@ -570,9 +808,9 @@ export class CoreBackendService extends EventEmitter {
     // 2. Fallback to latest published 21.1.x from official maven-metadata.xml if 21.1.267 is unavailable
     if (!downloaded) {
       this.emitInstallProgress('Поиск актуальной сборки NeoForge 21.1.x в официальном Maven...', 10);
-      const metaRes = await fetch(`${NEOFORGE_MAVEN_BASE}/maven-metadata.xml`);
-      if (metaRes.ok) {
-        const xml = await metaRes.text();
+      try {
+        const xmlBuf = await this.downloadUrlToBuffer(`${NEOFORGE_MAVEN_BASE}/maven-metadata.xml`);
+        const xml = xmlBuf.toString('utf8');
         const matches = Array.from(xml.matchAll(/<version>(21\.1\.\d+)<\/version>/g)).map((m) => m[1]);
         const latest211 = matches.sort((a, b) => {
           const pa = Number(a.split('.')[2] || 0);
@@ -582,12 +820,19 @@ export class CoreBackendService extends EventEmitter {
         if (latest211 && latest211 !== NEOFORGE_LOADER_VERSION) {
           downloaded = await tryDownloadVersion(latest211);
         }
+      } catch (err) {
+        lastErrorReason = this.formatNetworkError(err);
+        this.appendLog(
+          'WARN',
+          'system',
+          `Не удалось получить maven-metadata.xml: ${lastErrorReason}`
+        );
       }
     }
 
     if (!downloaded) {
       throw new Error(
-        'Не удалось скачать установщик NeoForge 1.21.1 с maven.neoforged.net. Проверьте подключение к интернету.'
+        `Не удалось скачать установщик NeoForge 1.21.1 с maven.neoforged.net${lastErrorReason ? ` (${lastErrorReason})` : ''}. Проверьте доступ к интернету или положите neoforge-21.1.267-installer.jar в папку .minecraft.`
       );
     }
 
@@ -683,7 +928,7 @@ export class CoreBackendService extends EventEmitter {
       await new Promise<void>((resolve, reject) => {
         const proc = spawn(
           this.config.javaPath,
-          ['-jar', installerPath, '--installServer'],
+          ['-Djava.net.preferIPv4Stack=true', '-Djava.awt.headless=true', '-jar', installerPath, '--installServer'],
           {
             cwd: targetDir,
             shell: false,
@@ -2224,7 +2469,7 @@ export class CoreBackendService extends EventEmitter {
             let output = '';
             const installerProc = spawn(
               javaExe,
-              ['-Djava.awt.headless=true', '-jar', installerJar, flag, minecraftDir],
+              ['-Djava.net.preferIPv4Stack=true', '-Djava.awt.headless=true', '-jar', installerJar, flag, minecraftDir],
               { cwd: minecraftDir, shell: false }
             );
 
@@ -2594,13 +2839,10 @@ export class CoreBackendService extends EventEmitter {
     }
 
     try {
-      const metaRes = await fetch('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json', {
-        redirect: 'follow',
-      });
-      if (!metaRes.ok) {
-        throw new Error(`HTTP ${metaRes.status}`);
-      }
-      const meta = (await metaRes.json()) as {
+      const metaBuf = await this.downloadUrlToBuffer(
+        'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
+      );
+      const meta = JSON.parse(metaBuf.toString('utf8')) as {
         versions?: Array<{ id?: string; url?: string }>;
       };
       const entry = meta.versions?.find((v) => v.id === mcVersion && typeof v.url === 'string');
@@ -2608,11 +2850,8 @@ export class CoreBackendService extends EventEmitter {
         throw new Error(`Версия ${mcVersion} не найдена в version_manifest_v2.json`);
       }
 
-      const verRes = await fetch(entry.url, { redirect: 'follow' });
-      if (!verRes.ok) {
-        throw new Error(`HTTP ${verRes.status}`);
-      }
-      const vanillaJson = (await verRes.json()) as Record<string, unknown>;
+      const verBuf = await this.downloadUrlToBuffer(entry.url);
+      const vanillaJson = JSON.parse(verBuf.toString('utf8')) as Record<string, unknown>;
       fs.mkdirSync(localVanillaDir, { recursive: true });
       fs.writeFileSync(localVanillaJson, JSON.stringify(vanillaJson, null, 2), 'utf8');
       return vanillaJson;
@@ -2620,7 +2859,7 @@ export class CoreBackendService extends EventEmitter {
       this.appendLog(
         'WARN',
         'system',
-        `Не удалось получить манифест Minecraft ${mcVersion} с piston-meta.mojang.com (${err instanceof Error ? err.message : 'ошибка сети'}). Будет использован режим inheritsFrom с патчем JVM.`
+        `Не удалось получить манифест Minecraft ${mcVersion} с piston-meta.mojang.com (${this.formatNetworkError(err)}). Будет использован режим inheritsFrom с патчем JVM.`
       );
       return null;
     }
@@ -2680,15 +2919,10 @@ export class CoreBackendService extends EventEmitter {
 
       if (artifact.url && typeof artifact.url === 'string' && artifact.url.startsWith('https://')) {
         try {
-          const res = await fetch(artifact.url, { redirect: 'follow' });
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer());
-            if (buf.length > 0) {
-              fs.mkdirSync(path.dirname(destPath), { recursive: true });
-              fs.writeFileSync(destPath, buf);
-              downloaded++;
-              if (isBootstrap) bootstrapPath = destPath;
-            }
+          await this.downloadUrlToFile(artifact.url, destPath);
+          if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+            downloaded++;
+            if (isBootstrap) bootstrapPath = destPath;
           }
         } catch {
           // Will be caught below if critical bootstraplauncher is still missing
