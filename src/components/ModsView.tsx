@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   CheckCircle2,
   Clock,
   CopyPlus,
@@ -54,6 +55,11 @@ export function ModsView({
   const unsyncedCount = useMemo(
     () => mods.sourceMods.filter((m) => !m.syncedToServer || !m.sizeMatchesServer).length,
     [mods.sourceMods]
+  );
+
+  const modsWithMissingDeps = useMemo(
+    () => mods.serverMods.filter((m) => m.missingDeps && m.missingDeps.length > 0),
+    [mods.serverMods]
   );
 
   const visibleList = useMemo(() => {
@@ -164,6 +170,36 @@ export function ModsView({
         </div>
       </section>
 
+      {/* Missing Mod Dependencies Warning Banner */}
+      {modsWithMissingDeps.length > 0 && (
+        <section className="rounded-xl bg-red-950/25 border border-red-500/35 px-5 py-4 flex flex-wrap items-start justify-between gap-4">
+          <div className="flex items-start gap-3 min-w-0 flex-1">
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+            <div className="space-y-1 min-w-0">
+              <p className="text-xs font-semibold text-red-300">
+                Обнаружены моды сервера без обязательных библиотек ({modsWithMissingDeps.length}) — сервер не запустится до исправления
+              </p>
+              <ul className="space-y-0.5 text-xs text-red-200/90 font-mono">
+                {modsWithMissingDeps.map((m) => (
+                  <li key={m.name} className="break-words">
+                    {m.name} → требуется: {m.missingDeps?.join(', ')}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+          {viewMode !== 'server' && (
+            <button
+              type="button"
+              onClick={() => setViewMode('server')}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-200 transition-colors whitespace-nowrap"
+            >
+              Показать проблемные моды
+            </button>
+          )}
+        </section>
+      )}
+
       {/* Mods Table */}
       <section className="rounded-xl bg-[#111827] border border-slate-800 overflow-hidden">
         <div className="px-5 py-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
@@ -255,7 +291,14 @@ export function ModsView({
               <tbody className="divide-y divide-slate-800/70 text-sm">
                 {visibleList.map((mod) => (
                   <tr key={mod.name} className="hover:bg-slate-800/35 transition-colors">
-                    <td className="py-2.5 px-5 font-mono text-xs text-slate-100">{mod.name}</td>
+                    <td className="py-2.5 px-5 font-mono text-xs text-slate-100">
+                      <div>{mod.name}</div>
+                      {mod.missingDeps && mod.missingDeps.length > 0 && (
+                        <div className="text-[11px] text-red-400 mt-0.5">
+                          Не хватает зависимостей: {mod.missingDeps.join(', ')}
+                        </div>
+                      )}
+                    </td>
                     <td className="py-2.5 px-4 font-mono text-xs tabular-nums text-slate-400 text-right whitespace-nowrap">
                       {formatSize(mod.sizeBytes)}
                     </td>

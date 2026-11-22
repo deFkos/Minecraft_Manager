@@ -44,6 +44,8 @@ export interface ModFileInfo {
   modifiedAt: string;
   syncedToServer: boolean;
   sizeMatchesServer: boolean;
+  modId?: string;
+  missingDeps?: string[];
 }
 
 export interface ModsState {

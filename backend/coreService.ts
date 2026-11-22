@@ -2312,6 +2312,9 @@ export class CoreBackendService extends EventEmitter {
       }
       this.emit('server-status', { ...this.runtime });
 
+      const modLoadErrors: string[] = [];
+      let sawModLoadingException = false;
+
       const handleStreamChunk = (chunk: Buffer, source: 'stdout' | 'stderr') => {
         const text = chunk.toString('utf8');
         for (const rawLine of text.split(/\r?\n/)) {
@@ -2319,6 +2322,18 @@ export class CoreBackendService extends EventEmitter {
           if (!line) continue;
           const level = classifyLogLevel(line, source);
           this.appendLog(level, source, line);
+
+          if (/ModLoadingException|Failed to start the minecraft server/i.test(line)) {
+            sawModLoadingException = true;
+          }
+          const modReqMatch = line.match(/^\s*-\s*Mod\s+([A-Za-z0-9_.-]+)\s+requires\s+([A-Za-z0-9_.-]+)\s*(.*)$/i);
+          if (modReqMatch) {
+            const [, modName, reqMod, reqVer] = modReqMatch;
+            const summary = `${modName} требует ${reqMod}${reqVer ? ` (${reqVer.trim()})` : ''}`;
+            if (!modLoadErrors.includes(summary)) {
+              modLoadErrors.push(summary);
+            }
+          }
 
           if (/Done\s*\([^)]+\)!/i.test(line) && this.runtime.status !== 'online') {
             this.updateRuntimeStatus('online', null);
@@ -2351,7 +2366,15 @@ export class CoreBackendService extends EventEmitter {
         this.runtime.pid = null;
         this.runtime.startedAt = null;
         this.clearActivePidFile();
-        if (code === 0 || code === null || wasStopping) {
+        if (modLoadErrors.length > 0 && !wasStopping) {
+          const errMsg = `Отсутствуют зависимости модов: ${modLoadErrors.join('; ')}. Установите недостающие библиотеки или удалите эти моды на вкладке «Моды».`;
+          this.appendLog('ERROR', 'system', errMsg);
+          this.updateRuntimeStatus('error', errMsg);
+        } else if (sawModLoadingException && !wasStopping) {
+          const errMsg = 'Сервер не смог загрузить моды (ModLoadingException). Проверьте лог выше и совместимость модов на вкладке «Моды».';
+          this.appendLog('ERROR', 'system', errMsg);
+          this.updateRuntimeStatus('error', errMsg);
+        } else if (code === 0 || code === null || wasStopping) {
           this.appendLog('SYSTEM', 'system', `Процесс сервера остановлен и порт освобождён (код выхода: ${code ?? 0}).`);
           this.updateRuntimeStatus('offline', null);
         } else {
@@ -2639,6 +2662,92 @@ export class CoreBackendService extends EventEmitter {
     }
   }
 
+  private inspectModJarMetadata(jarPath: string): { modIds: string[]; requiredServerDeps: string[] } {
+    const modIds: string[] = [];
+    const requiredServerDeps: string[] = [];
+
+    const toml =
+      this.readTextEntryFromZip(jarPath, 'META-INF/neoforge.mods.toml') ??
+      this.readTextEntryFromZip(jarPath, 'META-INF/mods.toml');
+
+    if (toml) {
+      let section: 'root' | 'mod' | 'dep' = 'root';
+      let depModId = '';
+      let depRequired = true;
+      let depSide = 'BOTH';
+
+      const flushDep = () => {
+        if (section === 'dep' && depModId && depRequired && depSide.toUpperCase() !== 'CLIENT') {
+          const clean = depModId.toLowerCase();
+          if (!requiredServerDeps.includes(clean)) {
+            requiredServerDeps.push(clean);
+          }
+        }
+        depModId = '';
+        depRequired = true;
+        depSide = 'BOTH';
+      };
+
+      for (const rawLine of toml.split(/\r?\n/)) {
+        const line = rawLine.replace(/#.*$/, '').trim();
+        if (!line) continue;
+
+        if (/^\[\[mods\]\]/i.test(line)) {
+          flushDep();
+          section = 'mod';
+          continue;
+        }
+        if (/^\[\[dependencies\.[^\]]+\]\]/i.test(line)) {
+          flushDep();
+          section = 'dep';
+          continue;
+        }
+        if (/^\[/.test(line)) {
+          flushDep();
+          section = 'root';
+          continue;
+        }
+
+        const kv = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+        if (!kv) continue;
+        const key = kv[1].trim();
+        const valRaw = kv[2].trim();
+        const strVal = valRaw.replace(/^["']|["']$/g, '').trim();
+
+        if (section === 'mod' && key === 'modId' && strVal) {
+          const clean = strVal.toLowerCase();
+          if (!modIds.includes(clean)) modIds.push(clean);
+        } else if (section === 'dep') {
+          if (key === 'modId') depModId = strVal;
+          else if (key === 'mandatory') depRequired = strVal.toLowerCase() === 'true';
+          else if (key === 'type') depRequired = strVal.toLowerCase() === 'required';
+          else if (key === 'side') depSide = strVal;
+        }
+      }
+      flushDep();
+    }
+
+    // Recognize Jar-in-Jar embedded artifacts (e.g., bundled libraries inside a mod JAR)
+    const jarJarMeta = this.readTextEntryFromZip(jarPath, 'META-INF/jarjar/metadata.json');
+    if (jarJarMeta) {
+      try {
+        const parsed = JSON.parse(jarJarMeta) as {
+          jars?: Array<{ identifier?: { artifact?: string } }>;
+        };
+        if (Array.isArray(parsed.jars)) {
+          for (const j of parsed.jars) {
+            const art = j?.identifier?.artifact?.toLowerCase();
+            if (art && !modIds.includes(art)) modIds.push(art);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return { modIds, requiredServerDeps };
+  }
+
   public scanMods(overrideSourceDir?: string): ModsState {
     const sourceDir = this.resolveSafePath(overrideSourceDir || this.config.modsSourceDir);
     if (overrideSourceDir && sourceDir !== this.config.modsSourceDir) {
@@ -2661,6 +2770,20 @@ export class CoreBackendService extends EventEmitter {
     const sourceMap = readJarDir(sourceDir);
     const serverMap = readJarDir(serverModsDir);
 
+    // Inspect installed server mods for NeoForge required dependency checks
+    const builtInModIds = new Set(['minecraft', 'neoforge', 'forge', 'java', 'fmlcore']);
+    const installedModIds = new Set<string>(builtInModIds);
+    const serverMetaByFile = new Map<string, { modIds: string[]; requiredServerDeps: string[] }>();
+
+    for (const [name] of serverMap.entries()) {
+      const fullPath = path.join(serverModsDir, name);
+      const meta = this.inspectModJarMetadata(fullPath);
+      serverMetaByFile.set(name, meta);
+      for (const id of meta.modIds) {
+        installedModIds.add(id);
+      }
+    }
+
     const sourceMods: ModFileInfo[] = Array.from(sourceMap.entries())
       .map(([name, stat]) => {
         const srvStat = serverMap.get(name);
@@ -2675,13 +2798,21 @@ export class CoreBackendService extends EventEmitter {
       .sort((a, b) => a.name.localeCompare(b.name));
 
     const serverMods: ModFileInfo[] = Array.from(serverMap.entries())
-      .map(([name, stat]) => ({
-        name,
-        sizeBytes: stat.size,
-        modifiedAt: stat.mtime.toISOString(),
-        syncedToServer: true,
-        sizeMatchesServer: true,
-      }))
+      .map(([name, stat]) => {
+        const meta = serverMetaByFile.get(name);
+        const missingDeps = meta
+          ? meta.requiredServerDeps.filter((dep) => !installedModIds.has(dep))
+          : [];
+        return {
+          name,
+          sizeBytes: stat.size,
+          modifiedAt: stat.mtime.toISOString(),
+          syncedToServer: true,
+          sizeMatchesServer: true,
+          modId: meta?.modIds[0],
+          missingDeps: missingDeps.length > 0 ? missingDeps : undefined,
+        };
+      })
       .sort((a, b) => a.name.localeCompare(b.name));
 
     return {
